@@ -12,6 +12,7 @@
 
 #include <string.h>
 #include "zmq.h"
+#include "zmq_utils.h"
 
 
 #define REG_PACKAGE_IS_CONSTRUCTOR 0
@@ -25,19 +26,63 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <errno.h>
 
 #ifdef _MSC_VER
+#define __WINDOWS__
+#else
+#if defined(_WIN32)
+#define __WINDOWS__
+#endif
+#endif
+
+#ifdef __WINDOWS__
+
+/* for MinGW32 compiler need to include <stdint.h> */
+#ifdef __GNUC__
+#include <stdint.h>
+#else
 
 /* define some standard types missing on Windows. */
+#ifndef __INT32_MAX__
 typedef __int32 int32_t;
-typedef __int64 int64_t;
 typedef unsigned __int32 uint32_t;
+#endif
+#ifndef __INT64_MAX__
+typedef __int64 int64_t;
 typedef unsigned __int64 uint64_t;
+#endif
 typedef int bool;
+#ifndef true
+#define true 1
+#endif
+#ifndef false
+#define false 1
+#endif
+
+#endif
+
+/* wrap strerror_s(). */
+#ifdef __GNUC__
+#ifndef strerror_r
+#define strerror_r(errno, buf, buflen) do { \
+	strncpy((buf), strerror(errno), (buflen)-1); \
+	(buf)[(buflen)-1] = '\0'; \
+} while(0)
+#endif
+#else
+#ifndef strerror_r
+#define strerror_r(errno, buf, buflen) strerror_s((buf), (buflen), (errno))
+#endif
+#endif
 
 #define FUNC_UNUSED
 
+#define LUA_NOBJ_API __declspec(dllexport)
+
 #else
+
+#define LUA_NOBJ_API LUALIB_API
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -171,6 +216,9 @@ static obj_type obj_types[] = {
 #define obj_type_id_ZMQ_Ctx 3
 #define obj_type_ZMQ_Ctx (obj_types[obj_type_id_ZMQ_Ctx])
   { NULL, 3, OBJ_TYPE_FLAG_WEAK_REF, "ZMQ_Ctx" },
+#define obj_type_id_ZMQ_StopWatch 4
+#define obj_type_ZMQ_StopWatch (obj_types[obj_type_id_ZMQ_StopWatch])
+  { NULL, 4, OBJ_TYPE_FLAG_WEAK_REF, "ZMQ_StopWatch" },
   {NULL, -1, 0, NULL},
 };
 
@@ -242,7 +290,7 @@ static FUNC_UNUSED int obj_udata_is_compatible(lua_State *L, obj_udata *ud, void
 	return 0;
 }
 
-static FUNC_UNUSED obj_udata *obj_udata_luacheck_internal(lua_State *L, int _index, void **obj, obj_type *type) {
+static FUNC_UNUSED obj_udata *obj_udata_luacheck_internal(lua_State *L, int _index, void **obj, obj_type *type, int not_delete) {
 	obj_udata *ud;
 	base_caster_t caster = NULL;
 	/* make sure it's a userdata value. */
@@ -258,32 +306,35 @@ static FUNC_UNUSED obj_udata *obj_udata_luacheck_internal(lua_State *L, int _ind
 				}
 				/* check object pointer. */
 				if(*obj == NULL) {
-					luaL_error(L, "null %s", type->name); /* object was garbage collected? */
+					if(not_delete) {
+						luaL_error(L, "null %s", type->name); /* object was garbage collected? */
+					}
+					return NULL;
 				}
 				return ud;
 			}
 		}
 	}
-	luaL_typerror(L, _index, type->name); /* is not a userdata value. */
+	if(not_delete) {
+		luaL_typerror(L, _index, type->name); /* is not a userdata value. */
+	}
 	return NULL;
 }
 
 static FUNC_UNUSED void *obj_udata_luacheck(lua_State *L, int _index, obj_type *type) {
 	void *obj = NULL;
-	obj_udata_luacheck_internal(L, _index, &(obj), type);
+	obj_udata_luacheck_internal(L, _index, &(obj), type, 1);
 	return obj;
 }
 
 static FUNC_UNUSED void *obj_udata_luadelete(lua_State *L, int _index, obj_type *type, int *flags) {
 	void *obj;
-	obj_udata *ud = obj_udata_luacheck_internal(L, _index, &(obj), type);
+	obj_udata *ud = obj_udata_luacheck_internal(L, _index, &(obj), type, 0);
+	if(ud == NULL) return NULL;
 	*flags = ud->flags;
 	/* null userdata. */
 	ud->obj = NULL;
 	ud->flags = 0;
-	/* clear the metatable to invalidate userdata. */
-	lua_pushnil(L);
-	lua_setmetatable(L, _index);
 	return obj;
 }
 
@@ -310,14 +361,12 @@ static FUNC_UNUSED void obj_udata_luapush(lua_State *L, void *obj, obj_type *typ
 
 static FUNC_UNUSED void *obj_udata_luadelete_weak(lua_State *L, int _index, obj_type *type, int *flags) {
 	void *obj;
-	obj_udata *ud = obj_udata_luacheck_internal(L, _index, &(obj), type);
+	obj_udata *ud = obj_udata_luacheck_internal(L, _index, &(obj), type, 0);
+	if(ud == NULL) return NULL;
 	*flags = ud->flags;
 	/* null userdata. */
 	ud->obj = NULL;
 	ud->flags = 0;
-	/* clear the metatable to invalidate userdata. */
-	lua_pushnil(L);
-	lua_setmetatable(L, _index);
 	/* get objects weak table. */
 	lua_pushlightuserdata(L, obj_udata_weak_ref_key);
 	lua_rawget(L, LUA_REGISTRYINDEX); /* weak ref table. */
@@ -702,17 +751,25 @@ static int nobj_try_loading_ffi(lua_State *L, const char *ffi_mod_name,
 #define obj_type_ZMQ_Ctx_push(L, obj, flags) \
 	obj_udata_luapush_weak(L, (void *)obj, &(obj_type_ZMQ_Ctx), flags)
 
+#define obj_type_ZMQ_StopWatch_check(L, _index) \
+	obj_udata_luacheck(L, _index, &(obj_type_ZMQ_StopWatch))
+#define obj_type_ZMQ_StopWatch_delete(L, _index, flags) \
+	obj_udata_luadelete_weak(L, _index, &(obj_type_ZMQ_StopWatch), flags)
+#define obj_type_ZMQ_StopWatch_push(L, obj, flags) \
+	obj_udata_luapush_weak(L, (void *)obj, &(obj_type_ZMQ_StopWatch), flags)
 
 
 
-static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
+
+static const char zmq_ffi_lua_code[] = "local error = error\n"
+"local type = type\n"
+"local tonumber = tonumber\n"
+"local tostring = tostring\n"
+"local rawset = rawset\n"
+"\n"
+"-- try loading luajit's ffi\n"
 "local stat, ffi=pcall(require,\"ffi\")\n"
 "if not stat then\n"
-"	return\n"
-"end\n"
-"-- check if ffi is disabled.\n"
-"if disable_ffi then\n"
-"	print(\"FFI disabled: Using standard Lua api interface.\")\n"
 "	return\n"
 "end\n"
 "\n"
@@ -729,7 +786,18 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "local OBJ_TYPE_FLAG_WEAK_REF	= 1\n"
 "local OBJ_TYPE_SIMPLE					= 2\n"
 "\n"
-"ffi.cdef[[\n"
+"local function ffi_safe_cdef(block_name, cdefs)\n"
+"	local fake_type = \"struct sentinel_\" .. block_name .. \"_ty\"\n"
+"	local stat, size = pcall(ffi.sizeof, fake_type)\n"
+"	if stat and size > 0 then\n"
+"		-- already loaded this cdef block\n"
+"		return\n"
+"	end\n"
+"	cdefs = fake_type .. \"{ int a; int b; int c; };\" .. cdefs\n"
+"	return ffi.cdef(cdefs)\n"
+"end\n"
+"\n"
+"ffi_safe_cdef(\"LuaNativeObjects\", [[\n"
 "\n"
 "typedef struct obj_type obj_type;\n"
 "\n"
@@ -754,27 +822,38 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "	uint32_t flags;  /**< lua_own:1bit */\n"
 "} obj_udata;\n"
 "\n"
-"]]\n"
+"]])\n"
 "\n"
 "-- cache mapping of cdata to userdata\n"
 "local weak_objects = setmetatable({}, { __mode = \"v\" })\n"
 "\n"
-"local function obj_udata_luacheck_internal(obj, type_mt)\n"
+"local function obj_udata_luacheck_internal(obj, type_mt, not_delete)\n"
 "	local obj_mt = d_getmetatable(obj)\n"
 "	if obj_mt == type_mt then\n"
 "		-- convert userdata to cdata.\n"
 "		return ffi.cast(\"obj_udata *\", obj)\n"
 "	end\n"
-"	error(\"(expected `\" .. type_mt['.name'] .. \"`, got \" .. type(obj) .. \")\", 3)\n"
+"	if not_delete then\n"
+"		error(\"(expected `\" .. type_mt['.name'] .. \"`, got \" .. type(obj) .. \")\", 3)\n"
+"	end\n"
 "end\n"
 "\n"
 "local function obj_udata_luacheck(obj, type_mt)\n"
-"	local ud = obj_udata_luacheck_internal(obj, type_mt)\n"
+"	local ud = obj_udata_luacheck_internal(obj, type_mt, true)\n"
 "	return ud.obj\n"
 "end\n"
 "\n"
+"local function obj_udata_to_cdata(objects, ud_obj, c_type, ud_mt)\n"
+"	-- convert userdata to cdata.\n"
+"	local c_obj = ffi.cast(c_type, obj_udata_luacheck(ud_obj, ud_mt))\n"
+"	-- cache converted cdata\n"
+"	rawset(objects, ud_obj, c_obj)\n"
+"	return c_obj\n"
+"end\n"
+"\n"
 "local function obj_udata_luadelete(ud_obj, type_mt)\n"
-"	local ud = obj_udata_luacheck_internal(ud_obj, type_mt)\n"
+"	local ud = obj_udata_luacheck_internal(ud_obj, type_mt, false)\n"
+"	if not ud then return nil, 0 end\n"
 "	local obj, flags = ud.obj, ud.flags\n"
 "	-- null userdata.\n"
 "	ud.obj = nil\n"
@@ -797,7 +876,7 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "	end\n"
 "\n"
 "	-- create new userdata\n"
-"	ud_obj = udata_new(ffi.sizeof\"obj_udata\", type_mt)\n"
+"	local ud_obj = udata_new(ffi.sizeof\"obj_udata\", type_mt)\n"
 "	local ud = ffi.cast(\"obj_udata *\", ud_obj)\n"
 "	-- init. object\n"
 "	ud.obj = obj\n"
@@ -807,7 +886,8 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "end\n"
 "\n"
 "local function obj_udata_luadelete_weak(ud_obj, type_mt)\n"
-"	local ud = obj_udata_luacheck_internal(ud_obj, type_mt)\n"
+"	local ud = obj_udata_luacheck_internal(ud_obj, type_mt, false)\n"
+"	if not ud then return nil, 0 end\n"
 "	local obj, flags = ud.obj, ud.flags\n"
 "	-- null userdata.\n"
 "	ud.obj = nil\n"
@@ -859,6 +939,14 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "	error(\"(expected `\" .. type_mt['.name'] .. \"`, got \" .. type(ud_obj) .. \")\", 3)\n"
 "end\n"
 "\n"
+"local function obj_simple_udata_to_cdata(objects, ud_obj, c_type, ud_mt)\n"
+"	-- convert userdata to cdata.\n"
+"	local c_obj = ffi.cast(c_type, obj_simple_udata_luacheck(ud_obj, ud_mt))\n"
+"	-- cache converted cdata\n"
+"	rawset(objects, ud_obj, c_obj)\n"
+"	return c_obj\n"
+"end\n"
+"\n"
 "local function obj_simple_udata_luadelete(ud_obj, type_mt)\n"
 "	local c_obj = obj_simple_udata_luacheck(ud_obj, type_mt)\n"
 "	-- invalid userdata, by setting the metatable to nil.\n"
@@ -870,7 +958,7 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "	if c_obj == nil then return end\n"
 "\n"
 "	-- create new userdata\n"
-"	ud_obj = udata_new(size, type_mt)\n"
+"	local ud_obj = udata_new(size, type_mt)\n"
 "	local cdata = ffi.cast(\"void *\", ud_obj)\n"
 "	-- init. object\n"
 "	ffi.copy(cdata, c_obj, size)\n"
@@ -879,18 +967,27 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "end\n"
 "\n"
 "ffi.cdef[[\n"
+"typedef struct zmq_msg_t zmq_msg_t;\n"
+"typedef struct ZMQ_Socket ZMQ_Socket;\n"
+"typedef struct ZMQ_Poller ZMQ_Poller;\n"
+"typedef struct ZMQ_Ctx ZMQ_Ctx;\n"
+"typedef struct ZMQ_StopWatch ZMQ_StopWatch;\n"
+"\n"
+"]]\n"
+"\n"
+"ffi.cdef[[\n"
 "typedef const char * (*get_zmq_strerror_func)();\n"
 "\n"
 "typedef int ZMQ_Error;\n"
 "\n"
 "\n"
-"typedef struct zmq_msg_t\n"
+"struct zmq_msg_t\n"
 "{\n"
 "	void *content;\n"
 "	unsigned char flags;\n"
 "	unsigned char vsm_size;\n"
 "	unsigned char vsm_data [30]; /* that '30' is from 'MAX_VSM_SIZE' */\n"
-"} zmq_msg_t;\n"
+"};\n"
 "\n"
 "typedef void (zmq_free_fn) (void *data, void *hint);\n"
 "\n"
@@ -899,38 +996,36 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "int zmq_msg_init_data (zmq_msg_t *msg, void *data, size_t size, zmq_free_fn *ffn, void *hint);\n"
 "\n"
 "\n"
-"ZMQ_Error zmq_msg_close(zmq_msg_t * this);\n"
+"ZMQ_Error zmq_msg_close(zmq_msg_t * this1);\n"
 "\n"
-"ZMQ_Error zmq_msg_close(zmq_msg_t * this);\n"
+"ZMQ_Error zmq_msg_close(zmq_msg_t * this1);\n"
 "\n"
-"ZMQ_Error zmq_msg_move(zmq_msg_t * this, zmq_msg_t * src);\n"
+"ZMQ_Error zmq_msg_move(zmq_msg_t * this1, zmq_msg_t * src2);\n"
 "\n"
-"ZMQ_Error zmq_msg_copy(zmq_msg_t * this, zmq_msg_t * src);\n"
+"ZMQ_Error zmq_msg_copy(zmq_msg_t * this1, zmq_msg_t * src2);\n"
 "\n"
-"void * zmq_msg_data(zmq_msg_t * this);\n"
+"void * zmq_msg_data(zmq_msg_t * this1);\n"
 "\n"
-"size_t zmq_msg_size(zmq_msg_t * this);\n"
+"size_t zmq_msg_size(zmq_msg_t * this1);\n"
 "\n"
-"typedef void * ZMQ_Socket;\n"
+"ZMQ_Error zmq_close(ZMQ_Socket * this1);\n"
 "\n"
-"ZMQ_Error zmq_close(ZMQ_Socket * this);\n"
+"ZMQ_Error zmq_bind(ZMQ_Socket * this1, const char * addr2);\n"
 "\n"
-"ZMQ_Error zmq_bind(ZMQ_Socket * this, const char * addr);\n"
-"\n"
-"ZMQ_Error zmq_connect(ZMQ_Socket * this, const char * addr);\n"
+"ZMQ_Error zmq_connect(ZMQ_Socket * this1, const char * addr2);\n"
 "\n"
 "int zmq_setsockopt (void *s, int option, const void *optval, size_t optvallen);\n"
 "int zmq_getsockopt (void *s, int option, void *optval, size_t *optvallen);\n"
 "\n"
-"ZMQ_Error zmq_send(ZMQ_Socket * this, zmq_msg_t * msg, int flags);\n"
+"ZMQ_Error zmq_send(ZMQ_Socket * this1, zmq_msg_t * msg2, int flags3);\n"
 "\n"
-"typedef ZMQ_Error (*simple_zmq_send_func)(ZMQ_Socket sock, const char *data, size_t data_len, int flags);\n"
+"typedef ZMQ_Error (*simple_zmq_send_func)(ZMQ_Socket *sock, const char *data, size_t data_len, int flags);\n"
 "\n"
-"ZMQ_Error zmq_recv(ZMQ_Socket * this, zmq_msg_t * msg, int flags);\n"
+"ZMQ_Error zmq_recv(ZMQ_Socket * this1, zmq_msg_t * msg2, int flags3);\n"
 "\n"
 "typedef int socket_t;\n"
 "typedef struct zmq_pollitem_t {\n"
-"	ZMQ_Socket socket;\n"
+"	ZMQ_Socket *socket;\n"
 "	socket_t fd;\n"
 "	short events;\n"
 "	short revents;\n"
@@ -938,36 +1033,55 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "\n"
 "int zmq_poll(zmq_pollitem_t *items, int nitems, long timeout);\n"
 "\n"
-"typedef struct ZMQ_Poller {\n"
+"struct ZMQ_Poller {\n"
 "	zmq_pollitem_t *items;\n"
 "	int    next;\n"
 "	int    count;\n"
 "	int    free_list;\n"
 "	int    len;\n"
-"} ZMQ_Poller;\n"
+"};\n"
 "\n"
-"typedef int (*poller_find_sock_item_func)(ZMQ_Poller *this, ZMQ_Socket *sock);\n"
+"typedef int (*poller_find_sock_item_func)(ZMQ_Poller *poller, ZMQ_Socket *sock);\n"
 "\n"
-"typedef int (*poller_find_fd_item_func)(ZMQ_Poller *this, socket_t fd);\n"
+"typedef int (*poller_find_fd_item_func)(ZMQ_Poller *poller, socket_t fd);\n"
 "\n"
-"typedef int (*poller_get_free_item_func)(ZMQ_Poller *this);\n"
+"typedef int (*poller_get_free_item_func)(ZMQ_Poller *poller);\n"
 "\n"
-"typedef int (*poller_poll_func)(ZMQ_Poller *this, long timeout);\n"
+"typedef int (*poller_poll_func)(ZMQ_Poller *poller, long timeout);\n"
 "\n"
-"typedef void (*poller_remove_item_func)(ZMQ_Poller *this, int idx);\n"
+"typedef void (*poller_remove_item_func)(ZMQ_Poller *poller, int idx);\n"
 "\n"
-"typedef void * ZMQ_Ctx;\n"
+"ZMQ_Error zmq_term(ZMQ_Ctx * this1);\n"
 "\n"
-"ZMQ_Error zmq_term(ZMQ_Ctx * this);\n"
+"ZMQ_Socket * zmq_socket(ZMQ_Ctx * this1, int type2);\n"
 "\n"
-"ZMQ_Socket zmq_socket(ZMQ_Ctx * this, int type);\n"
+"ZMQ_StopWatch * zmq_stopwatch_start();\n"
 "\n"
-"ZMQ_Ctx zmq_init(int io_threads);\n"
+"unsigned long zmq_stopwatch_stop(ZMQ_StopWatch * this1);\n"
 "\n"
-"ZMQ_Error zmq_device(int device, ZMQ_Socket insock, ZMQ_Socket outsock);\n"
+"ZMQ_Ctx * zmq_init(int io_threads1);\n"
+"\n"
+"ZMQ_Error zmq_device(int device1, ZMQ_Socket * insock2, ZMQ_Socket * outsock3);\n"
+"\n"
+"ZMQ_StopWatch * zmq_stopwatch_start();\n"
+"\n"
+"void zmq_sleep(int seconds_1);\n"
 "\n"
 "\n"
 "]]\n"
+"\n"
+"local _pub = {}\n"
+"local _meth = {}\n"
+"for obj_name,mt in pairs(_priv) do\n"
+"	if type(mt) == 'table' and mt.__index then\n"
+"		_meth[obj_name] = mt.__index\n"
+"	end\n"
+"end\n"
+"_pub.zmq = _M\n"
+"for obj_name,pub in pairs(_M) do\n"
+"	_pub[obj_name] = pub\n"
+"end\n"
+"\n"
 "\n"
 "local obj_type_zmq_msg_t_check\n"
 "local obj_type_zmq_msg_t_delete\n"
@@ -975,16 +1089,13 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "\n"
 "(function()\n"
 "local zmq_msg_t_mt = _priv.zmq_msg_t\n"
-"local zmq_msg_t_objects = setmetatable({}, { __mode = \"k\" })\n"
+"local zmq_msg_t_objects = setmetatable({}, { __mode = \"k\",\n"
+"__index = function(objects, ud_obj)\n"
+"	return obj_simple_udata_to_cdata(objects, ud_obj, \"zmq_msg_t *\", zmq_msg_t_mt)\n"
+"end,\n"
+"})\n"
 "function obj_type_zmq_msg_t_check(ud_obj)\n"
-"	local c_obj = zmq_msg_t_objects[ud_obj]\n"
-"	if c_obj == nil then\n"
-"		-- cdata object not in cache\n"
-"		c_obj = obj_simple_udata_luacheck(ud_obj, zmq_msg_t_mt)\n"
-"		c_obj = ffi.cast(\"zmq_msg_t *\", c_obj) -- cast from 'void *'\n"
-"		zmq_msg_t_objects[ud_obj] = c_obj\n"
-"	end\n"
-"	return c_obj\n"
+"	return zmq_msg_t_objects[ud_obj]\n"
 "end\n"
 "\n"
 "function obj_type_zmq_msg_t_delete(ud_obj)\n"
@@ -1007,16 +1118,13 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "\n"
 "(function()\n"
 "local ZMQ_Socket_mt = _priv.ZMQ_Socket\n"
-"local ZMQ_Socket_objects = setmetatable({}, { __mode = \"k\" })\n"
+"local ZMQ_Socket_objects = setmetatable({}, { __mode = \"k\",\n"
+"__index = function(objects, ud_obj)\n"
+"	return obj_udata_to_cdata(objects, ud_obj, \"ZMQ_Socket *\", ZMQ_Socket_mt)\n"
+"end,\n"
+"})\n"
 "function obj_type_ZMQ_Socket_check(ud_obj)\n"
-"	local c_obj = ZMQ_Socket_objects[ud_obj]\n"
-"	if c_obj == nil then\n"
-"		-- cdata object not in cache\n"
-"		c_obj = obj_udata_luacheck(ud_obj, ZMQ_Socket_mt)\n"
-"		c_obj = ffi.cast(\"ZMQ_Socket *\", c_obj) -- cast from 'void *'\n"
-"		ZMQ_Socket_objects[ud_obj] = c_obj\n"
-"	end\n"
-"	return c_obj\n"
+"	return ZMQ_Socket_objects[ud_obj]\n"
 "end\n"
 "\n"
 "function obj_type_ZMQ_Socket_delete(ud_obj)\n"
@@ -1039,16 +1147,13 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "\n"
 "(function()\n"
 "local ZMQ_Poller_mt = _priv.ZMQ_Poller\n"
-"local ZMQ_Poller_objects = setmetatable({}, { __mode = \"k\" })\n"
+"local ZMQ_Poller_objects = setmetatable({}, { __mode = \"k\",\n"
+"__index = function(objects, ud_obj)\n"
+"	return obj_simple_udata_to_cdata(objects, ud_obj, \"ZMQ_Poller *\", ZMQ_Poller_mt)\n"
+"end,\n"
+"})\n"
 "function obj_type_ZMQ_Poller_check(ud_obj)\n"
-"	local c_obj = ZMQ_Poller_objects[ud_obj]\n"
-"	if c_obj == nil then\n"
-"		-- cdata object not in cache\n"
-"		c_obj = obj_simple_udata_luacheck(ud_obj, ZMQ_Poller_mt)\n"
-"		c_obj = ffi.cast(\"ZMQ_Poller *\", c_obj) -- cast from 'void *'\n"
-"		ZMQ_Poller_objects[ud_obj] = c_obj\n"
-"	end\n"
-"	return c_obj\n"
+"	return ZMQ_Poller_objects[ud_obj]\n"
 "end\n"
 "\n"
 "function obj_type_ZMQ_Poller_delete(ud_obj)\n"
@@ -1071,16 +1176,13 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "\n"
 "(function()\n"
 "local ZMQ_Ctx_mt = _priv.ZMQ_Ctx\n"
-"local ZMQ_Ctx_objects = setmetatable({}, { __mode = \"k\" })\n"
+"local ZMQ_Ctx_objects = setmetatable({}, { __mode = \"k\",\n"
+"__index = function(objects, ud_obj)\n"
+"	return obj_udata_to_cdata(objects, ud_obj, \"ZMQ_Ctx *\", ZMQ_Ctx_mt)\n"
+"end,\n"
+"})\n"
 "function obj_type_ZMQ_Ctx_check(ud_obj)\n"
-"	local c_obj = ZMQ_Ctx_objects[ud_obj]\n"
-"	if c_obj == nil then\n"
-"		-- cdata object not in cache\n"
-"		c_obj = obj_udata_luacheck(ud_obj, ZMQ_Ctx_mt)\n"
-"		c_obj = ffi.cast(\"ZMQ_Ctx *\", c_obj) -- cast from 'void *'\n"
-"		ZMQ_Ctx_objects[ud_obj] = c_obj\n"
-"	end\n"
-"	return c_obj\n"
+"	return ZMQ_Ctx_objects[ud_obj]\n"
 "end\n"
 "\n"
 "function obj_type_ZMQ_Ctx_delete(ud_obj)\n"
@@ -1097,25 +1199,53 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "end)()\n"
 "\n"
 "\n"
-"local _pub = {}\n"
-"local _meth = {}\n"
-"for obj_name,mt in pairs(_priv) do\n"
-"	if type(mt) == 'table' and mt.__index then\n"
-"		_meth[obj_name] = mt.__index\n"
-"	end\n"
-"end\n"
-"_pub.zmq = _M\n"
-"for obj_name,pub in pairs(_M) do\n"
-"	_pub[obj_name] = pub\n"
+"local obj_type_ZMQ_StopWatch_check\n"
+"local obj_type_ZMQ_StopWatch_delete\n"
+"local obj_type_ZMQ_StopWatch_push\n"
+"\n"
+"(function()\n"
+"local ZMQ_StopWatch_mt = _priv.ZMQ_StopWatch\n"
+"local ZMQ_StopWatch_objects = setmetatable({}, { __mode = \"k\",\n"
+"__index = function(objects, ud_obj)\n"
+"	return obj_udata_to_cdata(objects, ud_obj, \"ZMQ_StopWatch *\", ZMQ_StopWatch_mt)\n"
+"end,\n"
+"})\n"
+"function obj_type_ZMQ_StopWatch_check(ud_obj)\n"
+"	return ZMQ_StopWatch_objects[ud_obj]\n"
 "end\n"
 "\n"
+"function obj_type_ZMQ_StopWatch_delete(ud_obj)\n"
+"	ZMQ_StopWatch_objects[ud_obj] = nil\n"
+"	return obj_udata_luadelete_weak(ud_obj, ZMQ_StopWatch_mt)\n"
+"end\n"
+"\n"
+"local ZMQ_StopWatch_type = ffi.cast(\"obj_type *\", ZMQ_StopWatch_mt[\".type\"])\n"
+"function obj_type_ZMQ_StopWatch_push(c_obj, flags)\n"
+"	local ud_obj = obj_udata_luapush_weak(c_obj, ZMQ_StopWatch_mt, ZMQ_StopWatch_type, flags)\n"
+"	ZMQ_StopWatch_objects[ud_obj] = c_obj\n"
+"	return ud_obj\n"
+"end\n"
+"end)()\n"
+"\n"
+"\n"
+"local get_zmq_strerror = ffi.new(\"get_zmq_strerror_func\", _priv[\"get_zmq_strerror\"])\n"
+"\n"
+"local simple_zmq_send = ffi.new(\"simple_zmq_send_func\", _priv[\"simple_zmq_send\"])\n"
+"\n"
+"local poller_find_sock_item = ffi.new(\"poller_find_sock_item_func\", _priv[\"poller_find_sock_item\"])\n"
+"\n"
+"local poller_find_fd_item = ffi.new(\"poller_find_fd_item_func\", _priv[\"poller_find_fd_item\"])\n"
+"\n"
+"local poller_get_free_item = ffi.new(\"poller_get_free_item_func\", _priv[\"poller_get_free_item\"])\n"
+"\n"
+"local poller_poll = ffi.new(\"poller_poll_func\", _priv[\"poller_poll\"])\n"
+"\n"
+"local poller_remove_item = ffi.new(\"poller_remove_item_func\", _priv[\"poller_remove_item\"])\n"
 "\n"
 "local os_lib_table = {\n"
 "	[\"Windows\"] = \"libzmq\",\n"
 "}\n"
 "local C = ffi.load(os_lib_table[ffi.os] or \"zmq\")\n"
-"\n"
-"local get_zmq_strerror = ffi.new(\"get_zmq_strerror_func\", _priv[\"get_zmq_strerror\"])\n"
 "\n"
 "local C_get_zmq_strerror = get_zmq_strerror\n"
 "-- make nicer wrapper for exported error function.\n"
@@ -1136,153 +1266,153 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "-- Start \"zmq_msg_t\" FFI interface\n"
 "-- method: __gc\n"
 "function _priv.zmq_msg_t.__gc(self)\n"
-"  local this,this_flags = obj_type_zmq_msg_t_delete(self)\n"
-"  if(band(this_flags,OBJ_UDATA_FLAG_OWN) == 0) then return end\n"
-"  local rc_zmq_msg_close\n"
-"  rc_zmq_msg_close = C.zmq_msg_close(this)\n"
+"  local this1,this_flags1 = obj_type_zmq_msg_t_delete(self)\n"
+"  if(band(this_flags1,OBJ_UDATA_FLAG_OWN) == 0) then return end\n"
+"  local rc_zmq_msg_close1\n"
+"  rc_zmq_msg_close1 = C.zmq_msg_close(this1)\n"
 "  -- check for error.\n"
-"  local rc_zmq_msg_close_err\n"
-"  if (-1 == rc_zmq_msg_close) then\n"
-"    rc_zmq_msg_close = false\n"
-"    rc_zmq_msg_close_err =   error_code__ZMQ_Error__push(rc_zmq_msg_close)\n"
+"  local rc_zmq_msg_close1_err\n"
+"  if (-1 == rc_zmq_msg_close1) then\n"
+"    rc_zmq_msg_close1_err =   error_code__ZMQ_Error__push(rc_zmq_msg_close1)\n"
+"    rc_zmq_msg_close1 = nil\n"
 "  else\n"
-"    rc_zmq_msg_close = true\n"
+"    rc_zmq_msg_close1 = true\n"
 "  end\n"
-"  return rc_zmq_msg_close, rc_zmq_msg_close_err\n"
+"  return rc_zmq_msg_close1, rc_zmq_msg_close1_err\n"
 "end\n"
 "\n"
 "-- method: close\n"
 "function _meth.zmq_msg_t.close(self)\n"
-"  local this = obj_type_zmq_msg_t_check(self)\n"
-"  local rc_zmq_msg_close\n"
-"  rc_zmq_msg_close = C.zmq_msg_close(this)\n"
+"  local this1 = obj_type_zmq_msg_t_check(self)\n"
+"  local rc_zmq_msg_close1\n"
+"  rc_zmq_msg_close1 = C.zmq_msg_close(this1)\n"
 "  -- check for error.\n"
-"  local rc_zmq_msg_close_err\n"
-"  if (-1 == rc_zmq_msg_close) then\n"
-"    rc_zmq_msg_close = false\n"
-"    rc_zmq_msg_close_err =   error_code__ZMQ_Error__push(rc_zmq_msg_close)\n"
+"  local rc_zmq_msg_close1_err\n"
+"  if (-1 == rc_zmq_msg_close1) then\n"
+"    rc_zmq_msg_close1_err =   error_code__ZMQ_Error__push(rc_zmq_msg_close1)\n"
+"    rc_zmq_msg_close1 = nil\n"
 "  else\n"
-"    rc_zmq_msg_close = true\n"
+"    rc_zmq_msg_close1 = true\n"
 "  end\n"
-"  return rc_zmq_msg_close, rc_zmq_msg_close_err\n"
+"  return rc_zmq_msg_close1, rc_zmq_msg_close1_err\n"
 "end\n"
 "\n"
 "-- method: move\n"
-"function _meth.zmq_msg_t.move(self, src)\n"
-"  local this = obj_type_zmq_msg_t_check(self)\n"
-"  src = obj_type_zmq_msg_t_check(src)\n"
-"  local rc_zmq_msg_move\n"
-"  rc_zmq_msg_move = C.zmq_msg_move(this, src)\n"
+"function _meth.zmq_msg_t.move(self, src2)\n"
+"  local this1 = obj_type_zmq_msg_t_check(self)\n"
+"  src2 = obj_type_zmq_msg_t_check(src2)\n"
+"  local rc_zmq_msg_move1\n"
+"  rc_zmq_msg_move1 = C.zmq_msg_move(this1, src2)\n"
 "  -- check for error.\n"
-"  local rc_zmq_msg_move_err\n"
-"  if (-1 == rc_zmq_msg_move) then\n"
-"    rc_zmq_msg_move = false\n"
-"    rc_zmq_msg_move_err =   error_code__ZMQ_Error__push(rc_zmq_msg_move)\n"
+"  local rc_zmq_msg_move1_err\n"
+"  if (-1 == rc_zmq_msg_move1) then\n"
+"    rc_zmq_msg_move1_err =   error_code__ZMQ_Error__push(rc_zmq_msg_move1)\n"
+"    rc_zmq_msg_move1 = nil\n"
 "  else\n"
-"    rc_zmq_msg_move = true\n"
+"    rc_zmq_msg_move1 = true\n"
 "  end\n"
-"  return rc_zmq_msg_move, rc_zmq_msg_move_err\n"
+"  return rc_zmq_msg_move1, rc_zmq_msg_move1_err\n"
 "end\n"
 "\n"
 "-- method: copy\n"
-"function _meth.zmq_msg_t.copy(self, src)\n"
-"  local this = obj_type_zmq_msg_t_check(self)\n"
-"  src = obj_type_zmq_msg_t_check(src)\n"
-"  local rc_zmq_msg_copy\n"
-"  rc_zmq_msg_copy = C.zmq_msg_copy(this, src)\n"
+"function _meth.zmq_msg_t.copy(self, src2)\n"
+"  local this1 = obj_type_zmq_msg_t_check(self)\n"
+"  src2 = obj_type_zmq_msg_t_check(src2)\n"
+"  local rc_zmq_msg_copy1\n"
+"  rc_zmq_msg_copy1 = C.zmq_msg_copy(this1, src2)\n"
 "  -- check for error.\n"
-"  local rc_zmq_msg_copy_err\n"
-"  if (-1 == rc_zmq_msg_copy) then\n"
-"    rc_zmq_msg_copy = false\n"
-"    rc_zmq_msg_copy_err =   error_code__ZMQ_Error__push(rc_zmq_msg_copy)\n"
+"  local rc_zmq_msg_copy1_err\n"
+"  if (-1 == rc_zmq_msg_copy1) then\n"
+"    rc_zmq_msg_copy1_err =   error_code__ZMQ_Error__push(rc_zmq_msg_copy1)\n"
+"    rc_zmq_msg_copy1 = nil\n"
 "  else\n"
-"    rc_zmq_msg_copy = true\n"
+"    rc_zmq_msg_copy1 = true\n"
 "  end\n"
-"  return rc_zmq_msg_copy, rc_zmq_msg_copy_err\n"
+"  return rc_zmq_msg_copy1, rc_zmq_msg_copy1_err\n"
 "end\n"
 "\n"
 "-- method: set_data\n"
-"function _meth.zmq_msg_t.set_data(self, data)\n"
-"  local this = obj_type_zmq_msg_t_check(self)\n"
-"  local data_len = #data\n"
-"  local err\n"
+"function _meth.zmq_msg_t.set_data(self, data2)\n"
+"  local this1 = obj_type_zmq_msg_t_check(self)\n"
+"  local data_len2 = #data2\n"
+"  local err1\n"
 "	-- check message data size.\n"
-"	if (C.zmq_msg_size(this) ~= data_len) then\n"
+"	if (C.zmq_msg_size(this1) ~= data_len2) then\n"
 "		-- need to resize message.\n"
-"		C.zmq_msg_close(this); -- close old message, to free old data.\n"
-"		err = C.zmq_msg_init_size(this, data_len); -- re-initialize message.\n"
-"		if (0 ~= err) then\n"
+"		C.zmq_msg_close(this1); -- close old message, to free old data.\n"
+"		err1 = C.zmq_msg_init_size(this1, data_len2); -- re-initialize message.\n"
+"		if (0 ~= err1) then\n"
 "			error(\"set_data() failed: \" .. get_zmq_strerror());\n"
 "		end\n"
 "	end\n"
 "	-- copy data into message\n"
-"	ffi.copy(C.zmq_msg_data(this), data, data_len);\n"
+"	ffi.copy(C.zmq_msg_data(this1), data2, data_len2);\n"
 "\n"
 "  -- check for error.\n"
-"  local err_err\n"
-"  if (-1 == err) then\n"
-"    err = false\n"
-"    err_err =   error_code__ZMQ_Error__push(err)\n"
+"  local err1_err\n"
+"  if (-1 == err1) then\n"
+"    err1_err =   error_code__ZMQ_Error__push(err1)\n"
+"    err1 = nil\n"
 "  else\n"
-"    err = true\n"
+"    err1 = true\n"
 "  end\n"
-"  return err, err_err\n"
+"  return err1, err1_err\n"
 "end\n"
 "\n"
 "-- method: data\n"
 "function _meth.zmq_msg_t.data(self)\n"
-"  local this = obj_type_zmq_msg_t_check(self)\n"
-"  local rc_zmq_msg_data\n"
-"  rc_zmq_msg_data = C.zmq_msg_data(this)\n"
-"  rc_zmq_msg_data = rc_zmq_msg_data\n"
-"  return rc_zmq_msg_data\n"
+"  local this1 = obj_type_zmq_msg_t_check(self)\n"
+"  local rc_zmq_msg_data1\n"
+"  rc_zmq_msg_data1 = C.zmq_msg_data(this1)\n"
+"  rc_zmq_msg_data1 = rc_zmq_msg_data1\n"
+"  return rc_zmq_msg_data1\n"
 "end\n"
 "\n"
 "-- method: set_size\n"
-"function _meth.zmq_msg_t.set_size(self, size)\n"
-"  local this = obj_type_zmq_msg_t_check(self)\n"
+"function _meth.zmq_msg_t.set_size(self, size2)\n"
+"  local this1 = obj_type_zmq_msg_t_check(self)\n"
 "  \n"
-"  local err\n"
+"  local err1\n"
 "	-- check message data size.\n"
-"	if (C.zmq_msg_size(this) ~= size) then\n"
+"	if (C.zmq_msg_size(this1) ~= size2) then\n"
 "		-- need to resize message.\n"
-"		C.zmq_msg_close(this); -- close old message, to free old data.\n"
-"		err = C.zmq_msg_init_size(this, size); -- re-initialize message.\n"
-"		if (0 ~= err) then\n"
+"		C.zmq_msg_close(this1); -- close old message, to free old data.\n"
+"		err1 = C.zmq_msg_init_size(this1, size2); -- re-initialize message.\n"
+"		if (0 ~= err1) then\n"
 "			error(\"set_size() failed: \" .. get_zmq_strerror());\n"
 "		end\n"
 "	end\n"
 "\n"
 "  -- check for error.\n"
-"  local err_err\n"
-"  if (-1 == err) then\n"
-"    err = false\n"
-"    err_err =   error_code__ZMQ_Error__push(err)\n"
+"  local err1_err\n"
+"  if (-1 == err1) then\n"
+"    err1_err =   error_code__ZMQ_Error__push(err1)\n"
+"    err1 = nil\n"
 "  else\n"
-"    err = true\n"
+"    err1 = true\n"
 "  end\n"
-"  return err, err_err\n"
+"  return err1, err1_err\n"
 "end\n"
 "\n"
 "-- method: size\n"
 "function _meth.zmq_msg_t.size(self)\n"
-"  local this = obj_type_zmq_msg_t_check(self)\n"
-"  local rc_zmq_msg_size\n"
-"  rc_zmq_msg_size = C.zmq_msg_size(this)\n"
-"  rc_zmq_msg_size = rc_zmq_msg_size\n"
-"  return rc_zmq_msg_size\n"
+"  local this1 = obj_type_zmq_msg_t_check(self)\n"
+"  local rc_zmq_msg_size1\n"
+"  rc_zmq_msg_size1 = C.zmq_msg_size(this1)\n"
+"  rc_zmq_msg_size1 = rc_zmq_msg_size1\n"
+"  return rc_zmq_msg_size1\n"
 "end\n"
 "\n"
 "-- method: __tostring\n"
 "function _priv.zmq_msg_t.__tostring(self)\n"
-"  local this = obj_type_zmq_msg_t_check(self)\n"
-"  local data_len = 0\n"
-"  local data\n"
-"	data = C.zmq_msg_data(this);\n"
-"	data_len = C.zmq_msg_size(this);\n"
+"  local this1 = obj_type_zmq_msg_t_check(self)\n"
+"  local data_len1 = 0\n"
+"  local data1\n"
+"	data1 = C.zmq_msg_data(this1);\n"
+"	data_len1 = C.zmq_msg_size(this1);\n"
 "\n"
-"  data = ((nil ~= data) and ffi.string(data,data_len))\n"
-"  return data\n"
+"  data1 = ((nil ~= data1) and ffi.string(data1,data_len1))\n"
+"  return data1\n"
 "end\n"
 "\n"
 "-- End \"zmq_msg_t\" FFI interface\n"
@@ -1291,53 +1421,53 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "-- Start \"ZMQ_Socket\" FFI interface\n"
 "-- method: close\n"
 "function _meth.ZMQ_Socket.close(self)\n"
-"  local this,this_flags = obj_type_ZMQ_Socket_delete(self)\n"
-"  if(band(this_flags,OBJ_UDATA_FLAG_OWN) == 0) then return end\n"
-"  local rc_zmq_close\n"
-"  rc_zmq_close = C.zmq_close(this)\n"
+"  local this1,this_flags1 = obj_type_ZMQ_Socket_delete(self)\n"
+"  if(band(this_flags1,OBJ_UDATA_FLAG_OWN) == 0) then return end\n"
+"  local rc_zmq_close1\n"
+"  rc_zmq_close1 = C.zmq_close(this1)\n"
 "  -- check for error.\n"
-"  local rc_zmq_close_err\n"
-"  if (-1 == rc_zmq_close) then\n"
-"    rc_zmq_close = false\n"
-"    rc_zmq_close_err =   error_code__ZMQ_Error__push(rc_zmq_close)\n"
+"  local rc_zmq_close1_err\n"
+"  if (-1 == rc_zmq_close1) then\n"
+"    rc_zmq_close1_err =   error_code__ZMQ_Error__push(rc_zmq_close1)\n"
+"    rc_zmq_close1 = nil\n"
 "  else\n"
-"    rc_zmq_close = true\n"
+"    rc_zmq_close1 = true\n"
 "  end\n"
-"  return rc_zmq_close, rc_zmq_close_err\n"
+"  return rc_zmq_close1, rc_zmq_close1_err\n"
 "end\n"
 "\n"
 "-- method: bind\n"
-"function _meth.ZMQ_Socket.bind(self, addr)\n"
-"  local this = obj_type_ZMQ_Socket_check(self)\n"
-"  local addr_len = #addr\n"
-"  local rc_zmq_bind\n"
-"  rc_zmq_bind = C.zmq_bind(this, addr)\n"
+"function _meth.ZMQ_Socket.bind(self, addr2)\n"
+"  local this1 = obj_type_ZMQ_Socket_check(self)\n"
+"  local addr_len2 = #addr2\n"
+"  local rc_zmq_bind1\n"
+"  rc_zmq_bind1 = C.zmq_bind(this1, addr2)\n"
 "  -- check for error.\n"
-"  local rc_zmq_bind_err\n"
-"  if (-1 == rc_zmq_bind) then\n"
-"    rc_zmq_bind = false\n"
-"    rc_zmq_bind_err =   error_code__ZMQ_Error__push(rc_zmq_bind)\n"
+"  local rc_zmq_bind1_err\n"
+"  if (-1 == rc_zmq_bind1) then\n"
+"    rc_zmq_bind1_err =   error_code__ZMQ_Error__push(rc_zmq_bind1)\n"
+"    rc_zmq_bind1 = nil\n"
 "  else\n"
-"    rc_zmq_bind = true\n"
+"    rc_zmq_bind1 = true\n"
 "  end\n"
-"  return rc_zmq_bind, rc_zmq_bind_err\n"
+"  return rc_zmq_bind1, rc_zmq_bind1_err\n"
 "end\n"
 "\n"
 "-- method: connect\n"
-"function _meth.ZMQ_Socket.connect(self, addr)\n"
-"  local this = obj_type_ZMQ_Socket_check(self)\n"
-"  local addr_len = #addr\n"
-"  local rc_zmq_connect\n"
-"  rc_zmq_connect = C.zmq_connect(this, addr)\n"
+"function _meth.ZMQ_Socket.connect(self, addr2)\n"
+"  local this1 = obj_type_ZMQ_Socket_check(self)\n"
+"  local addr_len2 = #addr2\n"
+"  local rc_zmq_connect1\n"
+"  rc_zmq_connect1 = C.zmq_connect(this1, addr2)\n"
 "  -- check for error.\n"
-"  local rc_zmq_connect_err\n"
-"  if (-1 == rc_zmq_connect) then\n"
-"    rc_zmq_connect = false\n"
-"    rc_zmq_connect_err =   error_code__ZMQ_Error__push(rc_zmq_connect)\n"
+"  local rc_zmq_connect1_err\n"
+"  if (-1 == rc_zmq_connect1) then\n"
+"    rc_zmq_connect1_err =   error_code__ZMQ_Error__push(rc_zmq_connect1)\n"
+"    rc_zmq_connect1 = nil\n"
 "  else\n"
-"    rc_zmq_connect = true\n"
+"    rc_zmq_connect1 = true\n"
 "  end\n"
-"  return rc_zmq_connect, rc_zmq_connect_err\n"
+"  return rc_zmq_connect1, rc_zmq_connect1_err\n"
 "end\n"
 "\n"
 "local option_types = {\n"
@@ -1371,42 +1501,43 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "\n"
 "\n"
 "-- method: setopt\n"
-"function _meth.ZMQ_Socket.setopt(self, opt, val)\n"
-"  local this = obj_type_ZMQ_Socket_check(self)\n"
+"function _meth.ZMQ_Socket.setopt(self, opt2, val3)\n"
+"  local this1 = obj_type_ZMQ_Socket_check(self)\n"
 "  \n"
-"  local err\n"
-"	local ctype = option_types[opt]\n"
+"  local err1\n"
+"	local ctype = option_types[opt2]\n"
 "	local tval\n"
 "	local tval_len = 0\n"
 "	if ctype == 'string' then\n"
-"		tval = tostring(val)\n"
-"		tval_len = #val\n"
+"		tval = tostring(val3)\n"
+"		tval_len = #val3\n"
 "	else\n"
-"		tval = option_tmps[opt]\n"
-"		tval[0] = val\n"
-"		tval_len = option_len[opt]\n"
+"		tval = option_tmps[opt2]\n"
+"		tval[0] = val3\n"
+"		tval_len = option_len[opt2]\n"
 "	end\n"
-"	err = C.zmq_setsockopt(this, opt, tval, tval_len)\n"
+"	err1 = C.zmq_setsockopt(this1, opt2, tval, tval_len)\n"
 "\n"
 "  -- check for error.\n"
-"  local err_err\n"
-"  if (-1 == err) then\n"
-"    err = false\n"
-"    err_err =   error_code__ZMQ_Error__push(err)\n"
+"  local err1_err\n"
+"  if (-1 == err1) then\n"
+"    err1_err =   error_code__ZMQ_Error__push(err1)\n"
+"    err1 = nil\n"
 "  else\n"
-"    err = true\n"
+"    err1 = true\n"
 "  end\n"
-"  return err, err_err\n"
+"  return err1, err1_err\n"
 "end\n"
 "\n"
 "local tmp_val_len = ffi.new('size_t[1]', 4)\n"
 "\n"
 "-- method: getopt\n"
-"function _meth.ZMQ_Socket.getopt(self, opt)\n"
-"  local this = obj_type_ZMQ_Socket_check(self)\n"
+"function _meth.ZMQ_Socket.getopt(self, opt2)\n"
+"  local this1 = obj_type_ZMQ_Socket_check(self)\n"
 "  \n"
-"  local err\n"
-"	local ctype = option_types[opt]\n"
+"  local val1\n"
+"  local err2\n"
+"	local ctype = option_types[opt2]\n"
 "	local val\n"
 "	local val_len = tmp_val_len\n"
 "	if ctype == 'string' then\n"
@@ -1414,12 +1545,12 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "		val = ffi.new('uint8_t[?]', val_len[0])\n"
 "		ffi.fill(val, val_len[0])\n"
 "	else\n"
-"		val = option_tmps[opt]\n"
+"		val = option_tmps[opt2]\n"
 "		val[0] = 0\n"
-"		val_len[0] = option_len[opt]\n"
+"		val_len[0] = option_len[opt2]\n"
 "	end\n"
-"	err = C.zmq_getsockopt(this, opt, val, val_len)\n"
-"	if err == 0 then\n"
+"	err2 = C.zmq_getsockopt(this1, opt2, val, val_len)\n"
+"	if err2 == 0 then\n"
 "		if ctype == 'string' then\n"
 "			val_len = val_len[0]\n"
 "			return ffi.string(val, val_len)\n"
@@ -1428,8 +1559,8 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "		end\n"
 "	end\n"
 "\n"
-"  err =   error_code__ZMQ_Error__push(err)\n"
-"  return err\n"
+"  err2 =   error_code__ZMQ_Error__push(err2)\n"
+"  return val1, err2\n"
 "end\n"
 "\n"
 "-- temp. values for 'events' function.\n"
@@ -1440,88 +1571,86 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "\n"
 "-- method: events\n"
 "function _meth.ZMQ_Socket.events(self)\n"
-"  local this = obj_type_ZMQ_Socket_check(self)\n"
-"  local events\n"
-"  local err\n"
+"  local this1 = obj_type_ZMQ_Socket_check(self)\n"
+"  local events1\n"
+"  local err2\n"
 "	events_tmp_len[0] = events_tmp_size\n"
-"	err = C.zmq_getsockopt(this, ZMQ_EVENTS, events_tmp, events_tmp_len);\n"
-"	events = events_tmp[0]\n"
+"	err2 = C.zmq_getsockopt(this1, ZMQ_EVENTS, events_tmp, events_tmp_len);\n"
+"	events1 = events_tmp[0]\n"
 "\n"
-"  if not (-1 == err) then\n"
-"    events = events\n"
+"  if not (-1 == err2) then\n"
+"    events1 = events1\n"
 "  else\n"
-"    events = nil\n"
+"    events1 = nil\n"
 "  end\n"
-"  err =   error_code__ZMQ_Error__push(err)\n"
-"  return events, err\n"
+"  err2 =   error_code__ZMQ_Error__push(err2)\n"
+"  return events1, err2\n"
 "end\n"
 "\n"
 "-- method: send_msg\n"
-"function _meth.ZMQ_Socket.send_msg(self, msg, flags)\n"
-"  local this = obj_type_ZMQ_Socket_check(self)\n"
-"  msg = obj_type_zmq_msg_t_check(msg)\n"
-"    flags = flags or 0\n"
-"  local rc_zmq_send\n"
-"  rc_zmq_send = C.zmq_send(this, msg, flags)\n"
+"function _meth.ZMQ_Socket.send_msg(self, msg2, flags3)\n"
+"  local this1 = obj_type_ZMQ_Socket_check(self)\n"
+"  msg2 = obj_type_zmq_msg_t_check(msg2)\n"
+"    flags3 = flags3 or 0\n"
+"  local rc_zmq_send1\n"
+"  rc_zmq_send1 = C.zmq_send(this1, msg2, flags3)\n"
 "  -- check for error.\n"
-"  local rc_zmq_send_err\n"
-"  if (-1 == rc_zmq_send) then\n"
-"    rc_zmq_send = false\n"
-"    rc_zmq_send_err =   error_code__ZMQ_Error__push(rc_zmq_send)\n"
+"  local rc_zmq_send1_err\n"
+"  if (-1 == rc_zmq_send1) then\n"
+"    rc_zmq_send1_err =   error_code__ZMQ_Error__push(rc_zmq_send1)\n"
+"    rc_zmq_send1 = nil\n"
 "  else\n"
-"    rc_zmq_send = true\n"
+"    rc_zmq_send1 = true\n"
 "  end\n"
-"  return rc_zmq_send, rc_zmq_send_err\n"
+"  return rc_zmq_send1, rc_zmq_send1_err\n"
 "end\n"
 "\n"
-"local simple_zmq_send = ffi.new(\"simple_zmq_send_func\", _priv[\"simple_zmq_send\"])\n"
-"\n"
 "-- method: send\n"
-"function _meth.ZMQ_Socket.send(self, data, flags)\n"
-"  local this = obj_type_ZMQ_Socket_check(self)\n"
-"  local data_len = #data\n"
-"    flags = flags or 0\n"
-"  local err\n"
-"	err = simple_zmq_send(this, data, data_len, flags);\n"
+"function _meth.ZMQ_Socket.send(self, data2, flags3)\n"
+"  local this1 = obj_type_ZMQ_Socket_check(self)\n"
+"  local data_len2 = #data2\n"
+"    flags3 = flags3 or 0\n"
+"  local err1\n"
+"	err1 = simple_zmq_send(this1, data2, data_len2, flags3);\n"
 "\n"
 "  -- check for error.\n"
-"  local err_err\n"
-"  if (-1 == err) then\n"
-"    err = false\n"
-"    err_err =   error_code__ZMQ_Error__push(err)\n"
+"  local err1_err\n"
+"  if (-1 == err1) then\n"
+"    err1_err =   error_code__ZMQ_Error__push(err1)\n"
+"    err1 = nil\n"
 "  else\n"
-"    err = true\n"
+"    err1 = true\n"
 "  end\n"
-"  return err, err_err\n"
+"  return err1, err1_err\n"
 "end\n"
 "\n"
 "-- method: recv_msg\n"
-"function _meth.ZMQ_Socket.recv_msg(self, msg, flags)\n"
-"  local this = obj_type_ZMQ_Socket_check(self)\n"
-"  msg = obj_type_zmq_msg_t_check(msg)\n"
-"    flags = flags or 0\n"
-"  local rc_zmq_recv\n"
-"  rc_zmq_recv = C.zmq_recv(this, msg, flags)\n"
+"function _meth.ZMQ_Socket.recv_msg(self, msg2, flags3)\n"
+"  local this1 = obj_type_ZMQ_Socket_check(self)\n"
+"  msg2 = obj_type_zmq_msg_t_check(msg2)\n"
+"    flags3 = flags3 or 0\n"
+"  local rc_zmq_recv1\n"
+"  rc_zmq_recv1 = C.zmq_recv(this1, msg2, flags3)\n"
 "  -- check for error.\n"
-"  local rc_zmq_recv_err\n"
-"  if (-1 == rc_zmq_recv) then\n"
-"    rc_zmq_recv = false\n"
-"    rc_zmq_recv_err =   error_code__ZMQ_Error__push(rc_zmq_recv)\n"
+"  local rc_zmq_recv1_err\n"
+"  if (-1 == rc_zmq_recv1) then\n"
+"    rc_zmq_recv1_err =   error_code__ZMQ_Error__push(rc_zmq_recv1)\n"
+"    rc_zmq_recv1 = nil\n"
 "  else\n"
-"    rc_zmq_recv = true\n"
+"    rc_zmq_recv1 = true\n"
 "  end\n"
-"  return rc_zmq_recv, rc_zmq_recv_err\n"
+"  return rc_zmq_recv1, rc_zmq_recv1_err\n"
 "end\n"
 "\n"
 "local tmp_msg = ffi.new('zmq_msg_t')\n"
 "\n"
 "-- method: recv\n"
-"function _meth.ZMQ_Socket.recv(self, flags)\n"
-"  local this = obj_type_ZMQ_Socket_check(self)\n"
-"    flags = flags or 0\n"
-"  local data_len = 0\n"
-"  local data\n"
-"  local err\n"
+"function _meth.ZMQ_Socket.recv(self, flags2)\n"
+"  local this1 = obj_type_ZMQ_Socket_check(self)\n"
+"    flags2 = flags2 or 0\n"
+"  local data_len1 = 0\n"
+"  local data1\n"
+"  local err2\n"
 "	local msg = tmp_msg\n"
 "	-- initialize blank message.\n"
 "	if C.zmq_msg_init(msg) < 0 then\n"
@@ -1529,74 +1658,65 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "	end\n"
 "\n"
 "	-- receive message\n"
-"	err = C.zmq_recv(this, msg, flags)\n"
-"	if 0 == err then\n"
+"	err2 = C.zmq_recv(this1, msg, flags2)\n"
+"	if 0 == err2 then\n"
 "		local data = ffi.string(C.zmq_msg_data(msg), C.zmq_msg_size(msg))\n"
 "		-- close message\n"
 "		C.zmq_msg_close(msg)\n"
 "		return data\n"
 "	end\n"
 "\n"
-"  if not (-1 == err) then\n"
-"    data = ((nil ~= data) and ffi.string(data,data_len))\n"
+"  if not (-1 == err2) then\n"
+"    data1 = ((nil ~= data1) and ffi.string(data1,data_len1))\n"
 "  else\n"
-"    data = nil\n"
+"    data1 = nil\n"
 "  end\n"
-"  err =   error_code__ZMQ_Error__push(err)\n"
+"  err2 =   error_code__ZMQ_Error__push(err2)\n"
 "	-- close message\n"
 "	C.zmq_msg_close(msg)\n"
 "\n"
-"  return data, err\n"
+"  return data1, err2\n"
 "end\n"
 "\n"
 "-- End \"ZMQ_Socket\" FFI interface\n"
 "\n"
 "\n"
 "-- Start \"ZMQ_Poller\" FFI interface\n"
-"local poller_find_sock_item = ffi.new(\"poller_find_sock_item_func\", _priv[\"poller_find_sock_item\"])\n"
-"\n"
-"local poller_find_fd_item = ffi.new(\"poller_find_fd_item_func\", _priv[\"poller_find_fd_item\"])\n"
-"\n"
-"local poller_get_free_item = ffi.new(\"poller_get_free_item_func\", _priv[\"poller_get_free_item\"])\n"
-"\n"
-"local poller_poll = ffi.new(\"poller_poll_func\", _priv[\"poller_poll\"])\n"
-"\n"
-"local poller_remove_item = ffi.new(\"poller_remove_item_func\", _priv[\"poller_remove_item\"])\n"
-"\n"
 "-- method: poll\n"
-"function _meth.ZMQ_Poller.poll(self, timeout)\n"
-"  local this = obj_type_ZMQ_Poller_check(self)\n"
+"function _meth.ZMQ_Poller.poll(self, timeout2)\n"
+"  local this1 = obj_type_ZMQ_Poller_check(self)\n"
 "  \n"
-"  local err\n"
+"  local err1\n"
 "	-- poll for events\n"
-"	err = poller_poll(this, timeout)\n"
-"	if(err > 0) then\n"
-"		this.next = 0\n"
+"	err1 = poller_poll(this1, timeout2)\n"
+"	if(err1 > 0) then\n"
+"		this1.next = 0\n"
 "	else\n"
-"		this.next = -1\n"
+"		this1.next = -1\n"
 "	end\n"
 "\n"
 "  -- check for error.\n"
-"  local err_err\n"
-"  if (-1 == err) then\n"
-"    err = false\n"
-"    err_err =   error_code__ZMQ_Error__push(err)\n"
+"  local err1_err\n"
+"  if (-1 == err1) then\n"
+"    err1_err =   error_code__ZMQ_Error__push(err1)\n"
+"    err1 = nil\n"
 "  else\n"
-"    err = true\n"
+"    err1 = true\n"
 "  end\n"
-"  return err, err_err\n"
+"  return err1, err1_err\n"
 "end\n"
 "\n"
 "-- method: next_revents\n"
 "function _meth.ZMQ_Poller.next_revents(self)\n"
-"  local this = obj_type_ZMQ_Poller_check(self)\n"
-"  local revents\n"
+"  local this1 = obj_type_ZMQ_Poller_check(self)\n"
+"  local sock1\n"
+"  local revents2\n"
 "	local sock\n"
-"	local idx = this.next\n"
+"	local idx = this1.next\n"
 "	if (idx < 0) then return nil, -1 end\n"
-"	local count = this.count\n"
+"	local count = this1.count\n"
 "	-- find next item with pending events.\n"
-"	while (idx < count and this.items[idx].revents == 0) do\n"
+"	while (idx < count and this1.items[idx].revents == 0) do\n"
 "		idx = idx + 1\n"
 "		if (idx >= count) then\n"
 "			idx = -1\n"
@@ -1606,34 +1726,34 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "	-- did we find a pending event?\n"
 "	if(idx >= 0) then\n"
 "		-- push the event's sock/fd.\n"
-"		if(this.items[idx].socket ~= NULL) then\n"
-"			sock = obj_type_ZMQ_Socket_push(this.items[idx].socket, 0)\n"
+"		if(this1.items[idx].socket ~= nil) then\n"
+"			sock = obj_type_ZMQ_Socket_push(this1.items[idx].socket, 0)\n"
 "		else\n"
-"			sock = tonumber(this.items[idx].fd)\n"
+"			sock = tonumber(this1.items[idx].fd)\n"
 "		end\n"
-"		revents = this.items[idx].revents\n"
+"		revents2 = this1.items[idx].revents\n"
 "		-- is this the last event.\n"
 "		idx = idx + 1\n"
 "		if (idx >= count) then\n"
 "			idx = -1\n"
 "		end\n"
-"		this.next = idx\n"
-"		return sock, revents\n"
+"		this1.next = idx\n"
+"		return sock, revents2\n"
 "	end\n"
-"	this.next = idx\n"
+"	this1.next = idx\n"
 "\n"
-"  revents = revents\n"
-"  return revents\n"
+"  revents2 = revents2\n"
+"  return sock1, revents2\n"
 "end\n"
 "\n"
 "-- method: count\n"
 "function _meth.ZMQ_Poller.count(self)\n"
-"  local this = obj_type_ZMQ_Poller_check(self)\n"
-"  local count\n"
-"	count = this.count;\n"
+"  local this1 = obj_type_ZMQ_Poller_check(self)\n"
+"  local count1\n"
+"	count1 = this1.count;\n"
 "\n"
-"  count = count\n"
-"  return count\n"
+"  count1 = count1\n"
+"  return count1\n"
 "end\n"
 "\n"
 "-- End \"ZMQ_Poller\" FFI interface\n"
@@ -1642,91 +1762,130 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "-- Start \"ZMQ_Ctx\" FFI interface\n"
 "-- method: term\n"
 "function _meth.ZMQ_Ctx.term(self)\n"
-"  local this,this_flags = obj_type_ZMQ_Ctx_delete(self)\n"
-"  if(band(this_flags,OBJ_UDATA_FLAG_OWN) == 0) then return end\n"
-"  local rc_zmq_term\n"
-"  rc_zmq_term = C.zmq_term(this)\n"
+"  local this1,this_flags1 = obj_type_ZMQ_Ctx_delete(self)\n"
+"  if(band(this_flags1,OBJ_UDATA_FLAG_OWN) == 0) then return end\n"
+"  local rc_zmq_term1\n"
+"  rc_zmq_term1 = C.zmq_term(this1)\n"
 "  -- check for error.\n"
-"  local rc_zmq_term_err\n"
-"  if (-1 == rc_zmq_term) then\n"
-"    rc_zmq_term = false\n"
-"    rc_zmq_term_err =   error_code__ZMQ_Error__push(rc_zmq_term)\n"
+"  local rc_zmq_term1_err\n"
+"  if (-1 == rc_zmq_term1) then\n"
+"    rc_zmq_term1_err =   error_code__ZMQ_Error__push(rc_zmq_term1)\n"
+"    rc_zmq_term1 = nil\n"
 "  else\n"
-"    rc_zmq_term = true\n"
+"    rc_zmq_term1 = true\n"
 "  end\n"
-"  return rc_zmq_term, rc_zmq_term_err\n"
+"  return rc_zmq_term1, rc_zmq_term1_err\n"
 "end\n"
 "\n"
 "-- method: socket\n"
-"function _meth.ZMQ_Ctx.socket(self, type)\n"
-"  local this = obj_type_ZMQ_Ctx_check(self)\n"
+"function _meth.ZMQ_Ctx.socket(self, type2)\n"
+"  local this1 = obj_type_ZMQ_Ctx_check(self)\n"
 "  \n"
-"  local rc_zmq_socket_flags = OBJ_UDATA_FLAG_OWN\n"
-"  local rc_zmq_socket\n"
-"  rc_zmq_socket = C.zmq_socket(this, type)\n"
-"  local rc_zmq_socket_err\n"
-"  if (nil == rc_zmq_socket) then\n"
-"    rc_zmq_socket_err =   get_zmq_strerror()\n"
+"  local rc_zmq_socket_flags1 = OBJ_UDATA_FLAG_OWN\n"
+"  local rc_zmq_socket1\n"
+"  rc_zmq_socket1 = C.zmq_socket(this1, type2)\n"
+"  local rc_zmq_socket1_err\n"
+"  if (nil == rc_zmq_socket1) then\n"
+"    rc_zmq_socket1_err =   get_zmq_strerror()\n"
 "  else\n"
-"    rc_zmq_socket =   obj_type_ZMQ_Socket_push(rc_zmq_socket, rc_zmq_socket_flags)\n"
+"    rc_zmq_socket1 =   obj_type_ZMQ_Socket_push(rc_zmq_socket1, rc_zmq_socket_flags1)\n"
 "  end\n"
-"  return rc_zmq_socket, rc_zmq_socket_err\n"
+"  return rc_zmq_socket1, rc_zmq_socket1_err\n"
 "end\n"
 "\n"
 "-- End \"ZMQ_Ctx\" FFI interface\n"
 "\n"
+"\n"
+"-- Start \"ZMQ_StopWatch\" FFI interface\n"
+"-- method: start\n"
+"function _pub.ZMQ_StopWatch.start()\n"
+"  local this_flags1 = OBJ_UDATA_FLAG_OWN\n"
+"  local this1\n"
+"  this1 = C.zmq_stopwatch_start()\n"
+"  this1 =   obj_type_ZMQ_StopWatch_push(this1, this_flags1)\n"
+"  return this1\n"
+"end\n"
+"\n"
+"-- method: stop\n"
+"function _meth.ZMQ_StopWatch.stop(self)\n"
+"  local this1,this_flags1 = obj_type_ZMQ_StopWatch_delete(self)\n"
+"  if(band(this_flags1,OBJ_UDATA_FLAG_OWN) == 0) then return end\n"
+"  local usecs1\n"
+"  usecs1 = C.zmq_stopwatch_stop(this1)\n"
+"  usecs1 = tonumber(usecs1)\n"
+"  return usecs1\n"
+"end\n"
+"\n"
+"-- End \"ZMQ_StopWatch\" FFI interface\n"
+"\n"
 "-- method: init\n"
-"function _pub.zmq.init(io_threads)\n"
+"function _pub.zmq.init(io_threads1)\n"
 "  \n"
-"  local rc_zmq_init_flags = OBJ_UDATA_FLAG_OWN\n"
-"  local rc_zmq_init\n"
-"  rc_zmq_init = C.zmq_init(io_threads)\n"
-"  local rc_zmq_init_err\n"
-"  if (nil == rc_zmq_init) then\n"
-"    rc_zmq_init_err =   get_zmq_strerror()\n"
+"  local rc_zmq_init_flags1 = OBJ_UDATA_FLAG_OWN\n"
+"  local rc_zmq_init1\n"
+"  rc_zmq_init1 = C.zmq_init(io_threads1)\n"
+"  local rc_zmq_init1_err\n"
+"  if (nil == rc_zmq_init1) then\n"
+"    rc_zmq_init1_err =   get_zmq_strerror()\n"
 "  else\n"
-"    rc_zmq_init =   obj_type_ZMQ_Ctx_push(rc_zmq_init, rc_zmq_init_flags)\n"
+"    rc_zmq_init1 =   obj_type_ZMQ_Ctx_push(rc_zmq_init1, rc_zmq_init_flags1)\n"
 "  end\n"
-"  return rc_zmq_init, rc_zmq_init_err\n"
+"  return rc_zmq_init1, rc_zmq_init1_err\n"
 "end\n"
 "\n"
 "-- method: init_ctx\n"
-"function _pub.zmq.init_ctx(ptr)\n"
-"  local ctx\n"
-"	local p_type = type(ptr)\n"
+"function _pub.zmq.init_ctx(ptr1)\n"
+"  local ctx1\n"
+"	local p_type = type(ptr1)\n"
 "	if p_type == 'userdata' then\n"
-"		ctx = ffi.cast('void *', ptr);\n"
+"		ctx1 = ffi.cast('void *', ptr1);\n"
 "	elseif p_type == 'cdata' then\n"
-"		ctx = ptr;\n"
+"		ctx1 = ptr1;\n"
 "	else\n"
 "		return error(\"expected lightuserdata/cdata<void *>\");\n"
 "	end\n"
 "\n"
-"  local ctx_err\n"
-"  if (nil == ctx) then\n"
-"    ctx_err =   get_zmq_strerror()\n"
+"  local ctx1_err\n"
+"  if (nil == ctx1) then\n"
+"    ctx1_err =   get_zmq_strerror()\n"
 "  else\n"
-"    ctx =   obj_type_ZMQ_Ctx_push(ctx, 0)\n"
+"    ctx1 =   obj_type_ZMQ_Ctx_push(ctx1, 0)\n"
 "  end\n"
-"  return ctx, ctx_err\n"
+"  return ctx1, ctx1_err\n"
 "end\n"
 "\n"
 "-- method: device\n"
-"function _pub.zmq.device(device, insock, outsock)\n"
+"function _pub.zmq.device(device1, insock2, outsock3)\n"
 "  \n"
-"  insock = obj_type_ZMQ_Socket_check(insock)\n"
-"  outsock = obj_type_ZMQ_Socket_check(outsock)\n"
-"  local rc_zmq_device\n"
-"  rc_zmq_device = C.zmq_device(device, insock, outsock)\n"
+"  insock2 = obj_type_ZMQ_Socket_check(insock2)\n"
+"  outsock3 = obj_type_ZMQ_Socket_check(outsock3)\n"
+"  local rc_zmq_device1\n"
+"  rc_zmq_device1 = C.zmq_device(device1, insock2, outsock3)\n"
 "  -- check for error.\n"
-"  local rc_zmq_device_err\n"
-"  if (-1 == rc_zmq_device) then\n"
-"    rc_zmq_device = false\n"
-"    rc_zmq_device_err =   error_code__ZMQ_Error__push(rc_zmq_device)\n"
+"  local rc_zmq_device1_err\n"
+"  if (-1 == rc_zmq_device1) then\n"
+"    rc_zmq_device1_err =   error_code__ZMQ_Error__push(rc_zmq_device1)\n"
+"    rc_zmq_device1 = nil\n"
 "  else\n"
-"    rc_zmq_device = true\n"
+"    rc_zmq_device1 = true\n"
 "  end\n"
-"  return rc_zmq_device, rc_zmq_device_err\n"
+"  return rc_zmq_device1, rc_zmq_device1_err\n"
+"end\n"
+"\n"
+"-- method: stopwatch_start\n"
+"function _pub.zmq.stopwatch_start()\n"
+"  local rc_zmq_stopwatch_start_flags1 = OBJ_UDATA_FLAG_OWN\n"
+"  local rc_zmq_stopwatch_start1\n"
+"  rc_zmq_stopwatch_start1 = C.zmq_stopwatch_start()\n"
+"  rc_zmq_stopwatch_start1 =   obj_type_ZMQ_StopWatch_push(rc_zmq_stopwatch_start1, rc_zmq_stopwatch_start_flags1)\n"
+"  return rc_zmq_stopwatch_start1\n"
+"end\n"
+"\n"
+"-- method: sleep\n"
+"function _pub.zmq.sleep(seconds_1)\n"
+"  \n"
+"  C.zmq_sleep(seconds_1)\n"
+"  return \n"
 "end\n"
 "\n"
 "";
@@ -1740,15 +1899,18 @@ static const char zmq_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 #endif
 #endif
 
-typedef void * ZMQ_Socket;
+/* detect really old ZeroMQ 2.0.x series. */
+#if !defined(ZMQ_RCVMORE)
+#error "Your version of ZeroMQ is too old.  Please upgrade to version 2.1 or to the latest 2.0.x"
+#endif
 
-#if VERSION_2_1
+typedef struct ZMQ_Socket ZMQ_Socket;
+
 #ifdef _WIN32
 #include <winsock2.h>
 typedef SOCKET socket_t;
 #else
 typedef int socket_t;
-#endif
 #endif
 
 /* socket option types. */
@@ -1792,7 +1954,7 @@ static const int opt_types[] = {
 #endif
 
 
-static ZMQ_Error simple_zmq_send(ZMQ_Socket sock, const char *data, size_t data_len, int flags) {
+static ZMQ_Error simple_zmq_send(ZMQ_Socket *sock, const char *data, size_t data_len, int flags) {
 	ZMQ_Error err;
 	zmq_msg_t msg;
 	/* initialize message */
@@ -1808,44 +1970,47 @@ static ZMQ_Error simple_zmq_send(ZMQ_Socket sock, const char *data, size_t data_
 	return err;
 }
 
-typedef struct ZMQ_Poller {
+struct ZMQ_Poller {
 	zmq_pollitem_t *items;
 	int    next;
 	int    count;
 	int    free_list;
 	int    len;
-} ZMQ_Poller;
+};
+
+
+typedef struct ZMQ_Poller ZMQ_Poller;
 
 #define FREE_ITEM_EVENTS_TAG ((short)0xFFFF)
 
 #define ITEM_TO_INDEX(items, item) (item - (items))
 
-static int poller_resize_items(ZMQ_Poller *this, int len) {
-	int old_len = this->len;
+static int poller_resize_items(ZMQ_Poller *poller, int len) {
+	int old_len = poller->len;
 
 	/* make sure new length is atleast as large as items count. */
-	len = (this->count <= len) ? len : this->count;
+	len = (poller->count <= len) ? len : poller->count;
 
 	/* if the new length is the same as the old length, then don't try to resize. */
 	if(old_len == len) return len;
 
-	this->items = (zmq_pollitem_t *)realloc(this->items, len * sizeof(zmq_pollitem_t));
-	this->len = len;
+	poller->items = (zmq_pollitem_t *)realloc(poller->items, len * sizeof(zmq_pollitem_t));
+	poller->len = len;
 	if(len > old_len) {
 		/* clear new space. */
-		memset(&(this->items[old_len]), 0, (len - old_len) * sizeof(zmq_pollitem_t));
+		memset(&(poller->items[old_len]), 0, (len - old_len) * sizeof(zmq_pollitem_t));
 	}
 	return len;
 }
 
-static int poller_find_sock_item(ZMQ_Poller *this, ZMQ_Socket *sock) {
+static int poller_find_sock_item(ZMQ_Poller *poller, ZMQ_Socket *sock) {
 	zmq_pollitem_t *items;
 	int count;
 	int n;
 
 	/* find ZMQ_Socket */
-	items = this->items;
-	count = this->count;
+	items = poller->items;
+	count = poller->count;
 	for(n=0; n < count; n++) {
 		if(items[n].socket == sock) return n;
 	}
@@ -1853,14 +2018,14 @@ static int poller_find_sock_item(ZMQ_Poller *this, ZMQ_Socket *sock) {
 	return -1;
 }
 
-static int poller_find_fd_item(ZMQ_Poller *this, socket_t fd) {
+static int poller_find_fd_item(ZMQ_Poller *poller, socket_t fd) {
 	zmq_pollitem_t *items;
 	int count;
 	int n;
 
 	/* find fd */
-	items = this->items;
-	count = this->count;
+	items = poller->items;
+	count = poller->count;
 	for(n=0; n < count; n++) {
 		if(items[n].fd == fd) return n;
 	}
@@ -1868,55 +2033,55 @@ static int poller_find_fd_item(ZMQ_Poller *this, socket_t fd) {
 	return -1;
 }
 
-static void poller_remove_item(ZMQ_Poller *this, int idx) {
+static void poller_remove_item(ZMQ_Poller *poller, int idx) {
 	zmq_pollitem_t *items;
 	int free_list;
 	int count;
 
-	count = this->count;
+	count = poller->count;
 	/* no item to remove. */
 	if(idx >= count || count == 0) return;
 
-	items = this->items;
-	free_list = this->free_list;
+	items = poller->items;
+	free_list = poller->free_list;
 
 	/* link new free slot to head of free list. */
 	if(free_list >= 0 && free_list < count) {
 		/* use socket pointer for free list's 'next' field. */
 		items[idx].socket = &(items[free_list]);
 	} else {
-		/* free list is empty mark this slot as the end. */
+		/* free list is empty mark poller slot as the end. */
 		items[idx].socket = NULL;
 	}
-	this->free_list = idx;
-	/* mark this slot as a free slot. */
+	poller->free_list = idx;
+	/* mark poller slot as a free slot. */
 	items[idx].events = FREE_ITEM_EVENTS_TAG;
 	/* clear old revents. */
 	items[idx].revents = 0;
 }
 
-static int poller_get_free_item(ZMQ_Poller *this) {
+static int poller_get_free_item(ZMQ_Poller *poller) {
 	zmq_pollitem_t *curr;
 	zmq_pollitem_t *next;
 	int count;
 	int idx;
 
-	count = this->count;
-	idx = this->free_list;
+	count = poller->count;
+	idx = poller->free_list;
 	/* check for a free slot in the free list. */
 	if(idx >= 0 && idx < count) {
 		/* remove free slot from free list. */
-		curr = &(this->items[idx]);
+		curr = &(poller->items[idx]);
 		/* valid free slot. */
 		assert(curr->events == FREE_ITEM_EVENTS_TAG);
-		/* is this the last free slot? */
+		/* is poller the last free slot? */
 		next = ((zmq_pollitem_t *)curr->socket);
 		if(next != NULL) {
 			/* set next free slot as head of free list. */
-			this->free_list = ITEM_TO_INDEX(this->items, next);
+			poller->free_list = ITEM_TO_INDEX(poller->items, next);
 		} else {
 			/* free list is empty now. */
-			this->free_list = -1;
+			poller->free_list = -1;
 		}
 		/* clear slot */
 		memset(curr, 0, sizeof(zmq_pollitem_t));
@@ -1924,26 +2089,26 @@ static int poller_get_free_item(ZMQ_Poller *this) {
 	}
 
 	idx = count;
-	this->count = ++count;
+	poller->count = ++count;
 	/* make room for new item. */
-	if(count >= this->len) {
-		poller_resize_items(this, this->len + 10);
+	if(count >= poller->len) {
+		poller_resize_items(poller, poller->len + 10);
 	}
 	return idx;
 }
 
-static int poller_compact_items(ZMQ_Poller *this) {
+static int poller_compact_items(ZMQ_Poller *poller) {
 	zmq_pollitem_t *items;
 	int count;
 	int old_count;
 	int next;
 
-	count = this->count;
+	count = poller->count;
 	/* if no free slot, then return. */
-	if(this->free_list < 0) return count;
+	if(poller->free_list < 0) return count;
 	old_count = count;
 
-	items = this->items;
+	items = poller->items;
 	next = 0;
 	/* find first free slot. */
 	while(next < count && items[next].events != FREE_ITEM_EVENTS_TAG) {
@@ -1964,23 +2129,25 @@ static int poller_compact_items(ZMQ_Poller *this) {
 
 	/* clear old used-space */
 	memset(&(items[count]), 0, ((old_count - count) * sizeof(zmq_pollitem_t)));
-	this->count = count;
-	this->free_list = -1; /* free list is now empty. */
+	poller->count = count;
+	poller->free_list = -1; /* free list is now empty. */
 
-	assert(count <= this->len);
+	assert(count <= poller->len);
 	return count;
 }
 
-static int poller_poll(ZMQ_Poller *this, long timeout) {
+static int poller_poll(ZMQ_Poller *poller, long timeout) {
 	int count;
 	/* remove free slots from items list. */
-	count = poller_compact_items(this);
+	count = poller_compact_items(poller);
 	/* poll for events. */
-	return zmq_poll(this->items, count, timeout);
+	return zmq_poll(poller->items, count, timeout);
 }
 
 
-typedef void * ZMQ_Ctx;
+typedef struct ZMQ_Ctx ZMQ_Ctx;
+
+typedef struct ZMQ_StopWatch ZMQ_StopWatch;
 
 /*
  * This wrapper function is to make the EAGAIN/ETERM error messages more like
@@ -1992,9 +2159,11 @@ static const char *get_zmq_strerror() {
 	case EAGAIN:
 		return "timeout";
 		break;
+#if defined(ETERM)
 	case ETERM:
 		return "closed";
 		break;
+#endif
 	default:
 		break;
 	}
@@ -2019,76 +2188,76 @@ static void error_code__ZMQ_Error__push(lua_State *L, ZMQ_Error err) {
 
 /* method: init */
 static int zmq_msg_t__init__meth(lua_State *L) {
-  int this_flags = OBJ_UDATA_FLAG_OWN;
-  zmq_msg_t * this;
-  ZMQ_Error err = 0;
+  int this_flags1 = OBJ_UDATA_FLAG_OWN;
+  zmq_msg_t * this1;
+  ZMQ_Error err2 = 0;
 	zmq_msg_t tmp;
-	this = &tmp;
-	err = zmq_msg_init(this);
+	this1 = &tmp;
+	err2 = zmq_msg_init(this1);
 
-  if(!(-1 == err)) {
-    obj_type_zmq_msg_t_push(L, this, this_flags);
+  if(!(-1 == err2)) {
+    obj_type_zmq_msg_t_push(L, this1, this_flags1);
   } else {
     lua_pushnil(L);
   }
-  error_code__ZMQ_Error__push(L, err);
+  error_code__ZMQ_Error__push(L, err2);
   return 2;
 }
 
 /* method: init_size */
 static int zmq_msg_t__init_size__meth(lua_State *L) {
-  size_t size = luaL_checkinteger(L,1);
-  int this_flags = OBJ_UDATA_FLAG_OWN;
-  zmq_msg_t * this;
-  ZMQ_Error err = 0;
+  size_t size1 = luaL_checkinteger(L,1);
+  int this_flags1 = OBJ_UDATA_FLAG_OWN;
+  zmq_msg_t * this1;
+  ZMQ_Error err2 = 0;
 	zmq_msg_t tmp;
-	this = &tmp;
-	err = zmq_msg_init_size(this, size);
+	this1 = &tmp;
+	err2 = zmq_msg_init_size(this1, size1);
 
-  if(!(-1 == err)) {
-    obj_type_zmq_msg_t_push(L, this, this_flags);
+  if(!(-1 == err2)) {
+    obj_type_zmq_msg_t_push(L, this1, this_flags1);
   } else {
     lua_pushnil(L);
   }
-  error_code__ZMQ_Error__push(L, err);
+  error_code__ZMQ_Error__push(L, err2);
   return 2;
 }
 
 /* method: init_data */
 static int zmq_msg_t__init_data__meth(lua_State *L) {
-  size_t data_len;
-  const char * data = luaL_checklstring(L,1,&(data_len));
-  int this_flags = OBJ_UDATA_FLAG_OWN;
-  zmq_msg_t * this;
-  ZMQ_Error err = 0;
+  size_t data_len1;
+  const char * data1 = luaL_checklstring(L,1,&(data_len1));
+  int this_flags1 = OBJ_UDATA_FLAG_OWN;
+  zmq_msg_t * this1;
+  ZMQ_Error err2 = 0;
 	zmq_msg_t tmp;
-	this = &tmp;
-	err = zmq_msg_init_size(this, data_len);
-	if(0 == err) {
+	this1 = &tmp;
+	err2 = zmq_msg_init_size(this1, data_len1);
+	if(0 == err2) {
 		/* fill message */
-		memcpy(zmq_msg_data(this), data, data_len);
+		memcpy(zmq_msg_data(this1), data1, data_len1);
 	}
 
-  if(!(-1 == err)) {
-    obj_type_zmq_msg_t_push(L, this, this_flags);
+  if(!(-1 == err2)) {
+    obj_type_zmq_msg_t_push(L, this1, this_flags1);
   } else {
     lua_pushnil(L);
   }
-  error_code__ZMQ_Error__push(L, err);
+  error_code__ZMQ_Error__push(L, err2);
   return 2;
 }
 
 /* method: delete */
 static int zmq_msg_t__delete__meth(lua_State *L) {
-  int this_flags = 0;
-  zmq_msg_t * this = obj_type_zmq_msg_t_delete(L,1,&(this_flags));
-  ZMQ_Error rc_zmq_msg_close = 0;
-  if(!(this_flags & OBJ_UDATA_FLAG_OWN)) { return 0; }
-  rc_zmq_msg_close = zmq_msg_close(this);
+  int this_flags1 = 0;
+  zmq_msg_t * this1 = obj_type_zmq_msg_t_delete(L,1,&(this_flags1));
+  ZMQ_Error rc_zmq_msg_close1 = 0;
+  if(!(this_flags1 & OBJ_UDATA_FLAG_OWN)) { return 0; }
+  rc_zmq_msg_close1 = zmq_msg_close(this1);
   /* check for error. */
-  if((-1 == rc_zmq_msg_close)) {
-    lua_pushboolean(L, 0);
-      error_code__ZMQ_Error__push(L, rc_zmq_msg_close);
+  if((-1 == rc_zmq_msg_close1)) {
+    lua_pushnil(L);
+      error_code__ZMQ_Error__push(L, rc_zmq_msg_close1);
   } else {
     lua_pushboolean(L, 1);
     lua_pushnil(L);
@@ -2098,13 +2267,13 @@ static int zmq_msg_t__delete__meth(lua_State *L) {
 
 /* method: close */
 static int zmq_msg_t__close__meth(lua_State *L) {
-  zmq_msg_t * this = obj_type_zmq_msg_t_check(L,1);
-  ZMQ_Error rc_zmq_msg_close = 0;
-  rc_zmq_msg_close = zmq_msg_close(this);
+  zmq_msg_t * this1 = obj_type_zmq_msg_t_check(L,1);
+  ZMQ_Error rc_zmq_msg_close1 = 0;
+  rc_zmq_msg_close1 = zmq_msg_close(this1);
   /* check for error. */
-  if((-1 == rc_zmq_msg_close)) {
-    lua_pushboolean(L, 0);
-      error_code__ZMQ_Error__push(L, rc_zmq_msg_close);
+  if((-1 == rc_zmq_msg_close1)) {
+    lua_pushnil(L);
+      error_code__ZMQ_Error__push(L, rc_zmq_msg_close1);
   } else {
     lua_pushboolean(L, 1);
     lua_pushnil(L);
@@ -2114,14 +2283,14 @@ static int zmq_msg_t__close__meth(lua_State *L) {
 
 /* method: move */
 static int zmq_msg_t__move__meth(lua_State *L) {
-  zmq_msg_t * this = obj_type_zmq_msg_t_check(L,1);
-  zmq_msg_t * src = obj_type_zmq_msg_t_check(L,2);
-  ZMQ_Error rc_zmq_msg_move = 0;
-  rc_zmq_msg_move = zmq_msg_move(this, src);
+  zmq_msg_t * this1 = obj_type_zmq_msg_t_check(L,1);
+  zmq_msg_t * src2 = obj_type_zmq_msg_t_check(L,2);
+  ZMQ_Error rc_zmq_msg_move1 = 0;
+  rc_zmq_msg_move1 = zmq_msg_move(this1, src2);
   /* check for error. */
-  if((-1 == rc_zmq_msg_move)) {
-    lua_pushboolean(L, 0);
-      error_code__ZMQ_Error__push(L, rc_zmq_msg_move);
+  if((-1 == rc_zmq_msg_move1)) {
+    lua_pushnil(L);
+      error_code__ZMQ_Error__push(L, rc_zmq_msg_move1);
   } else {
     lua_pushboolean(L, 1);
     lua_pushnil(L);
@@ -2131,14 +2300,14 @@ static int zmq_msg_t__move__meth(lua_State *L) {
 
 /* method: copy */
 static int zmq_msg_t__copy__meth(lua_State *L) {
-  zmq_msg_t * this = obj_type_zmq_msg_t_check(L,1);
-  zmq_msg_t * src = obj_type_zmq_msg_t_check(L,2);
-  ZMQ_Error rc_zmq_msg_copy = 0;
-  rc_zmq_msg_copy = zmq_msg_copy(this, src);
+  zmq_msg_t * this1 = obj_type_zmq_msg_t_check(L,1);
+  zmq_msg_t * src2 = obj_type_zmq_msg_t_check(L,2);
+  ZMQ_Error rc_zmq_msg_copy1 = 0;
+  rc_zmq_msg_copy1 = zmq_msg_copy(this1, src2);
   /* check for error. */
-  if((-1 == rc_zmq_msg_copy)) {
-    lua_pushboolean(L, 0);
-      error_code__ZMQ_Error__push(L, rc_zmq_msg_copy);
+  if((-1 == rc_zmq_msg_copy1)) {
+    lua_pushnil(L);
+      error_code__ZMQ_Error__push(L, rc_zmq_msg_copy1);
   } else {
     lua_pushboolean(L, 1);
     lua_pushnil(L);
@@ -2148,26 +2317,26 @@ static int zmq_msg_t__copy__meth(lua_State *L) {
 
 /* method: set_data */
 static int zmq_msg_t__set_data__meth(lua_State *L) {
-  zmq_msg_t * this = obj_type_zmq_msg_t_check(L,1);
-  size_t data_len;
-  const char * data = luaL_checklstring(L,2,&(data_len));
-  ZMQ_Error err = 0;
+  zmq_msg_t * this1 = obj_type_zmq_msg_t_check(L,1);
+  size_t data_len2;
+  const char * data2 = luaL_checklstring(L,2,&(data_len2));
+  ZMQ_Error err1 = 0;
 	/* check message data size. */
-	if(zmq_msg_size(this) != data_len) {
+	if(zmq_msg_size(this1) != data_len2) {
 		/* need to resize message. */
-		zmq_msg_close(this); /* close old message, to free old data. */
-		err = zmq_msg_init_size(this, data_len); /* re-initialize message. */
-		if(0 != err) {
+		zmq_msg_close(this1); /* close old message, to free old data. */
+		err1 = zmq_msg_init_size(this1, data_len2); /* re-initialize message. */
+		if(0 != err1) {
 			luaL_error(L, "set_data() failed: %s", get_zmq_strerror());
 		}
 	}
 	/* copy data into message */
-	memcpy(zmq_msg_data(this), data, data_len);
+	memcpy(zmq_msg_data(this1), data2, data_len2);
 
   /* check for error. */
-  if((-1 == err)) {
-    lua_pushboolean(L, 0);
-      error_code__ZMQ_Error__push(L, err);
+  if((-1 == err1)) {
+    lua_pushnil(L);
+      error_code__ZMQ_Error__push(L, err1);
   } else {
     lua_pushboolean(L, 1);
     lua_pushnil(L);
@@ -2177,32 +2346,32 @@ static int zmq_msg_t__set_data__meth(lua_State *L) {
 
 /* method: data */
 static int zmq_msg_t__data__meth(lua_State *L) {
-  zmq_msg_t * this = obj_type_zmq_msg_t_check(L,1);
-  void * rc_zmq_msg_data = NULL;
-  rc_zmq_msg_data = zmq_msg_data(this);
-  lua_pushlightuserdata(L, rc_zmq_msg_data);
+  zmq_msg_t * this1 = obj_type_zmq_msg_t_check(L,1);
+  void * rc_zmq_msg_data1 = NULL;
+  rc_zmq_msg_data1 = zmq_msg_data(this1);
+  lua_pushlightuserdata(L, rc_zmq_msg_data1);
   return 1;
 }
 
 /* method: set_size */
 static int zmq_msg_t__set_size__meth(lua_State *L) {
-  zmq_msg_t * this = obj_type_zmq_msg_t_check(L,1);
-  size_t size = luaL_checkinteger(L,2);
-  ZMQ_Error err = 0;
+  zmq_msg_t * this1 = obj_type_zmq_msg_t_check(L,1);
+  size_t size2 = luaL_checkinteger(L,2);
+  ZMQ_Error err1 = 0;
 	/* check message data size. */
-	if(zmq_msg_size(this) != size) {
+	if(zmq_msg_size(this1) != size2) {
 		/* need to resize message. */
-		zmq_msg_close(this); /* close old message, to free old data. */
-		err = zmq_msg_init_size(this, size); /* re-initialize message. */
-		if(0 != err) {
+		zmq_msg_close(this1); /* close old message, to free old data. */
+		err1 = zmq_msg_init_size(this1, size2); /* re-initialize message. */
+		if(0 != err1) {
 			luaL_error(L, "set_size() failed: %s", get_zmq_strerror());
 		}
 	}
 
   /* check for error. */
-  if((-1 == err)) {
-    lua_pushboolean(L, 0);
-      error_code__ZMQ_Error__push(L, err);
+  if((-1 == err1)) {
+    lua_pushnil(L);
+      error_code__ZMQ_Error__push(L, err1);
   } else {
     lua_pushboolean(L, 1);
     lua_pushnil(L);
@@ -2212,36 +2381,36 @@ static int zmq_msg_t__set_size__meth(lua_State *L) {
 
 /* method: size */
 static int zmq_msg_t__size__meth(lua_State *L) {
-  zmq_msg_t * this = obj_type_zmq_msg_t_check(L,1);
-  size_t rc_zmq_msg_size = 0;
-  rc_zmq_msg_size = zmq_msg_size(this);
-  lua_pushinteger(L, rc_zmq_msg_size);
+  zmq_msg_t * this1 = obj_type_zmq_msg_t_check(L,1);
+  size_t rc_zmq_msg_size1 = 0;
+  rc_zmq_msg_size1 = zmq_msg_size(this1);
+  lua_pushinteger(L, rc_zmq_msg_size1);
   return 1;
 }
 
 /* method: __tostring */
 static int zmq_msg_t____tostring__meth(lua_State *L) {
-  zmq_msg_t * this = obj_type_zmq_msg_t_check(L,1);
-  size_t data_len = 0;
-  const char * data = NULL;
-	data = zmq_msg_data(this);
-	data_len = zmq_msg_size(this);
+  zmq_msg_t * this1 = obj_type_zmq_msg_t_check(L,1);
+  size_t data_len1 = 0;
+  const char * data1 = NULL;
+	data1 = zmq_msg_data(this1);
+	data_len1 = zmq_msg_size(this1);
 
-  if(data == NULL) lua_pushnil(L);  else lua_pushlstring(L, data,data_len);
+  if(data1 == NULL) lua_pushnil(L);  else lua_pushlstring(L, data1,data_len1);
   return 1;
 }
 
 /* method: close */
 static int ZMQ_Socket__close__meth(lua_State *L) {
-  int this_flags = 0;
-  ZMQ_Socket * this = obj_type_ZMQ_Socket_delete(L,1,&(this_flags));
-  ZMQ_Error rc_zmq_close = 0;
-  if(!(this_flags & OBJ_UDATA_FLAG_OWN)) { return 0; }
-  rc_zmq_close = zmq_close(this);
+  int this_flags1 = 0;
+  ZMQ_Socket * this1 = obj_type_ZMQ_Socket_delete(L,1,&(this_flags1));
+  ZMQ_Error rc_zmq_close1 = 0;
+  if(!(this_flags1 & OBJ_UDATA_FLAG_OWN)) { return 0; }
+  rc_zmq_close1 = zmq_close(this1);
   /* check for error. */
-  if((-1 == rc_zmq_close)) {
-    lua_pushboolean(L, 0);
-      error_code__ZMQ_Error__push(L, rc_zmq_close);
+  if((-1 == rc_zmq_close1)) {
+    lua_pushnil(L);
+      error_code__ZMQ_Error__push(L, rc_zmq_close1);
   } else {
     lua_pushboolean(L, 1);
     lua_pushnil(L);
@@ -2251,15 +2420,15 @@ static int ZMQ_Socket__close__meth(lua_State *L) {
 
 /* method: bind */
 static int ZMQ_Socket__bind__meth(lua_State *L) {
-  ZMQ_Socket * this = obj_type_ZMQ_Socket_check(L,1);
-  size_t addr_len;
-  const char * addr = luaL_checklstring(L,2,&(addr_len));
-  ZMQ_Error rc_zmq_bind = 0;
-  rc_zmq_bind = zmq_bind(this, addr);
+  ZMQ_Socket * this1 = obj_type_ZMQ_Socket_check(L,1);
+  size_t addr_len2;
+  const char * addr2 = luaL_checklstring(L,2,&(addr_len2));
+  ZMQ_Error rc_zmq_bind1 = 0;
+  rc_zmq_bind1 = zmq_bind(this1, addr2);
   /* check for error. */
-  if((-1 == rc_zmq_bind)) {
-    lua_pushboolean(L, 0);
-      error_code__ZMQ_Error__push(L, rc_zmq_bind);
+  if((-1 == rc_zmq_bind1)) {
+    lua_pushnil(L);
+      error_code__ZMQ_Error__push(L, rc_zmq_bind1);
   } else {
     lua_pushboolean(L, 1);
     lua_pushnil(L);
@@ -2269,15 +2438,15 @@ static int ZMQ_Socket__bind__meth(lua_State *L) {
 
 /* method: connect */
 static int ZMQ_Socket__connect__meth(lua_State *L) {
-  ZMQ_Socket * this = obj_type_ZMQ_Socket_check(L,1);
-  size_t addr_len;
-  const char * addr = luaL_checklstring(L,2,&(addr_len));
-  ZMQ_Error rc_zmq_connect = 0;
-  rc_zmq_connect = zmq_connect(this, addr);
+  ZMQ_Socket * this1 = obj_type_ZMQ_Socket_check(L,1);
+  size_t addr_len2;
+  const char * addr2 = luaL_checklstring(L,2,&(addr_len2));
+  ZMQ_Error rc_zmq_connect1 = 0;
+  rc_zmq_connect1 = zmq_connect(this1, addr2);
   /* check for error. */
-  if((-1 == rc_zmq_connect)) {
-    lua_pushboolean(L, 0);
-      error_code__ZMQ_Error__push(L, rc_zmq_connect);
+  if((-1 == rc_zmq_connect1)) {
+    lua_pushnil(L);
+      error_code__ZMQ_Error__push(L, rc_zmq_connect1);
   } else {
     lua_pushboolean(L, 1);
     lua_pushnil(L);
@@ -2287,9 +2456,9 @@ static int ZMQ_Socket__connect__meth(lua_State *L) {
 
 /* method: setopt */
 static int ZMQ_Socket__setopt__meth(lua_State *L) {
-  ZMQ_Socket * this = obj_type_ZMQ_Socket_check(L,1);
-  uint32_t opt = luaL_checkinteger(L,2);
-  ZMQ_Error err = 0;
+  ZMQ_Socket * this1 = obj_type_ZMQ_Socket_check(L,1);
+  uint32_t opt2 = luaL_checkinteger(L,2);
+  ZMQ_Error err1 = 0;
 	size_t val_len;
 	const void *val;
 
@@ -2301,11 +2470,11 @@ static int ZMQ_Socket__setopt__meth(lua_State *L) {
 	uint64_t uint64_val;
 	int64_t int64_val;
 
-	if(opt > MAX_OPTS) {
+	if(opt2 > MAX_OPTS) {
 		return luaL_argerror(L, 2, "Invalid socket option.");
 	}
 
-	switch(opt_types[opt]) {
+	switch(opt_types[opt2]) {
 #if VERSION_2_1
 	case OPT_TYPE_FD:
 		fd_val = luaL_checklong(L, 3);
@@ -2341,12 +2510,12 @@ static int ZMQ_Socket__setopt__meth(lua_State *L) {
 		abort();
 		break;
 	}
-	err = zmq_setsockopt(this, opt, val, val_len);
+	err1 = zmq_setsockopt(this1, opt2, val, val_len);
 
   /* check for error. */
-  if((-1 == err)) {
-    lua_pushboolean(L, 0);
-      error_code__ZMQ_Error__push(L, err);
+  if((-1 == err1)) {
+    lua_pushnil(L);
+      error_code__ZMQ_Error__push(L, err1);
   } else {
     lua_pushboolean(L, 1);
     lua_pushnil(L);
@@ -2356,9 +2525,9 @@ static int ZMQ_Socket__setopt__meth(lua_State *L) {
 
 /* method: getopt */
 static int ZMQ_Socket__getopt__meth(lua_State *L) {
-  ZMQ_Socket * this = obj_type_ZMQ_Socket_check(L,1);
-  uint32_t opt = luaL_checkinteger(L,2);
-  ZMQ_Error err = 0;
+  ZMQ_Socket * this1 = obj_type_ZMQ_Socket_check(L,1);
+  uint32_t opt2 = luaL_checkinteger(L,2);
+  ZMQ_Error err2 = 0;
 	size_t val_len;
 
 #if VERSION_2_1
@@ -2371,18 +2540,18 @@ static int ZMQ_Socket__getopt__meth(lua_State *L) {
 #define STR_MAX 255
 	char str_val[STR_MAX];
 
-	if(opt > MAX_OPTS) {
+	if(opt2 > MAX_OPTS) {
 		lua_pushnil(L);
 		lua_pushliteral(L, "Invalid socket option.");
 		return 2;
 	}
 
-	switch(opt_types[opt]) {
+	switch(opt_types[opt2]) {
 #if VERSION_2_1
 	case OPT_TYPE_FD:
 		val_len = sizeof(fd_val);
-		err = zmq_getsockopt(this, opt, &fd_val, &val_len);
-		if(0 == err) {
+		err2 = zmq_getsockopt(this1, opt2, &fd_val, &val_len);
+		if(0 == err2) {
 			lua_pushinteger(L, (lua_Integer)fd_val);
 			return 1;
 		}
@@ -2390,40 +2559,40 @@ static int ZMQ_Socket__getopt__meth(lua_State *L) {
 #endif
 	case OPT_TYPE_INT:
 		val_len = sizeof(int_val);
-		err = zmq_getsockopt(this, opt, &int_val, &val_len);
-		if(0 == err) {
+		err2 = zmq_getsockopt(this1, opt2, &int_val, &val_len);
+		if(0 == err2) {
 			lua_pushinteger(L, (lua_Integer)int_val);
 			return 1;
 		}
 		break;
 	case OPT_TYPE_UINT32:
 		val_len = sizeof(uint32_val);
-		err = zmq_getsockopt(this, opt, &uint32_val, &val_len);
-		if(0 == err) {
+		err2 = zmq_getsockopt(this1, opt2, &uint32_val, &val_len);
+		if(0 == err2) {
 			lua_pushinteger(L, (lua_Integer)uint32_val);
 			return 1;
 		}
 		break;
 	case OPT_TYPE_UINT64:
 		val_len = sizeof(uint64_val);
-		err = zmq_getsockopt(this, opt, &uint64_val, &val_len);
-		if(0 == err) {
+		err2 = zmq_getsockopt(this1, opt2, &uint64_val, &val_len);
+		if(0 == err2) {
 			lua_pushinteger(L, (lua_Integer)uint64_val);
 			return 1;
 		}
 		break;
 	case OPT_TYPE_INT64:
 		val_len = sizeof(int64_val);
-		err = zmq_getsockopt(this, opt, &int64_val, &val_len);
-		if(0 == err) {
+		err2 = zmq_getsockopt(this1, opt2, &int64_val, &val_len);
+		if(0 == err2) {
 			lua_pushinteger(L, (lua_Integer)int64_val);
 			return 1;
 		}
 		break;
 	case OPT_TYPE_STR:
 		val_len = STR_MAX;
-		err = zmq_getsockopt(this, opt, str_val, &val_len);
-		if(0 == err) {
+		err2 = zmq_getsockopt(this1, opt2, str_val, &val_len);
+		if(0 == err2) {
 			lua_pushlstring(L, str_val, val_len);
 			return 1;
 		}
@@ -2436,42 +2605,42 @@ static int ZMQ_Socket__getopt__meth(lua_State *L) {
 	}
 	lua_pushnil(L);
 
-  error_code__ZMQ_Error__push(L, err);
+  error_code__ZMQ_Error__push(L, err2);
   return 2;
 }
 
 /* method: events */
 static int ZMQ_Socket__events__meth(lua_State *L) {
-  ZMQ_Socket * this = obj_type_ZMQ_Socket_check(L,1);
-  uint32_t events = 0;
-  ZMQ_Error err = 0;
+  ZMQ_Socket * this1 = obj_type_ZMQ_Socket_check(L,1);
+  uint32_t events1 = 0;
+  ZMQ_Error err2 = 0;
 #if VERSION_2_1
-	size_t val_len = sizeof(events);
-	err = zmq_getsockopt(this, ZMQ_EVENTS, &(events), &val_len);
+	size_t val_len = sizeof(events1);
+	err2 = zmq_getsockopt(this1, ZMQ_EVENTS, &(events1), &val_len);
 #else
 	luaL_error(L, "'events' method only supported in 0MQ version >= 2.1");
 #endif
 
-  if(!(-1 == err)) {
-    lua_pushinteger(L, events);
+  if(!(-1 == err2)) {
+    lua_pushinteger(L, events1);
   } else {
     lua_pushnil(L);
   }
-  error_code__ZMQ_Error__push(L, err);
+  error_code__ZMQ_Error__push(L, err2);
   return 2;
 }
 
 /* method: send_msg */
 static int ZMQ_Socket__send_msg__meth(lua_State *L) {
-  ZMQ_Socket * this = obj_type_ZMQ_Socket_check(L,1);
-  zmq_msg_t * msg = obj_type_zmq_msg_t_check(L,2);
-  int flags = luaL_optinteger(L,3,0);
-  ZMQ_Error rc_zmq_send = 0;
-  rc_zmq_send = zmq_send(this, msg, flags);
+  ZMQ_Socket * this1 = obj_type_ZMQ_Socket_check(L,1);
+  zmq_msg_t * msg2 = obj_type_zmq_msg_t_check(L,2);
+  int flags3 = luaL_optinteger(L,3,0);
+  ZMQ_Error rc_zmq_send1 = 0;
+  rc_zmq_send1 = zmq_send(this1, msg2, flags3);
   /* check for error. */
-  if((-1 == rc_zmq_send)) {
-    lua_pushboolean(L, 0);
-      error_code__ZMQ_Error__push(L, rc_zmq_send);
+  if((-1 == rc_zmq_send1)) {
+    lua_pushnil(L);
+      error_code__ZMQ_Error__push(L, rc_zmq_send1);
   } else {
     lua_pushboolean(L, 1);
     lua_pushnil(L);
@@ -2481,17 +2650,17 @@ static int ZMQ_Socket__send_msg__meth(lua_State *L) {
 
 /* method: send */
 static int ZMQ_Socket__send__meth(lua_State *L) {
-  ZMQ_Socket * this = obj_type_ZMQ_Socket_check(L,1);
-  size_t data_len;
-  const char * data = luaL_checklstring(L,2,&(data_len));
-  int flags = luaL_optinteger(L,3,0);
-  ZMQ_Error err = 0;
-	err = simple_zmq_send(this, data, data_len, flags);
+  ZMQ_Socket * this1 = obj_type_ZMQ_Socket_check(L,1);
+  size_t data_len2;
+  const char * data2 = luaL_checklstring(L,2,&(data_len2));
+  int flags3 = luaL_optinteger(L,3,0);
+  ZMQ_Error err1 = 0;
+	err1 = simple_zmq_send(this1, data2, data_len2, flags3);
 
   /* check for error. */
-  if((-1 == err)) {
-    lua_pushboolean(L, 0);
-      error_code__ZMQ_Error__push(L, err);
+  if((-1 == err1)) {
+    lua_pushnil(L);
+      error_code__ZMQ_Error__push(L, err1);
   } else {
     lua_pushboolean(L, 1);
     lua_pushnil(L);
@@ -2501,15 +2670,15 @@ static int ZMQ_Socket__send__meth(lua_State *L) {
 
 /* method: recv_msg */
 static int ZMQ_Socket__recv_msg__meth(lua_State *L) {
-  ZMQ_Socket * this = obj_type_ZMQ_Socket_check(L,1);
-  zmq_msg_t * msg = obj_type_zmq_msg_t_check(L,2);
-  int flags = luaL_optinteger(L,3,0);
-  ZMQ_Error rc_zmq_recv = 0;
-  rc_zmq_recv = zmq_recv(this, msg, flags);
+  ZMQ_Socket * this1 = obj_type_ZMQ_Socket_check(L,1);
+  zmq_msg_t * msg2 = obj_type_zmq_msg_t_check(L,2);
+  int flags3 = luaL_optinteger(L,3,0);
+  ZMQ_Error rc_zmq_recv1 = 0;
+  rc_zmq_recv1 = zmq_recv(this1, msg2, flags3);
   /* check for error. */
-  if((-1 == rc_zmq_recv)) {
-    lua_pushboolean(L, 0);
-      error_code__ZMQ_Error__push(L, rc_zmq_recv);
+  if((-1 == rc_zmq_recv1)) {
+    lua_pushnil(L);
+      error_code__ZMQ_Error__push(L, rc_zmq_recv1);
   } else {
     lua_pushboolean(L, 1);
     lua_pushnil(L);
@@ -2519,29 +2688,29 @@ static int ZMQ_Socket__recv_msg__meth(lua_State *L) {
 
 /* method: recv */
 static int ZMQ_Socket__recv__meth(lua_State *L) {
-  ZMQ_Socket * this = obj_type_ZMQ_Socket_check(L,1);
-  int flags = luaL_optinteger(L,2,0);
-  size_t data_len = 0;
-  const char * data = NULL;
-  ZMQ_Error err = 0;
+  ZMQ_Socket * this1 = obj_type_ZMQ_Socket_check(L,1);
+  int flags2 = luaL_optinteger(L,2,0);
+  size_t data_len1 = 0;
+  const char * data1 = NULL;
+  ZMQ_Error err2 = 0;
 	zmq_msg_t msg;
 	/* initialize message */
-	err = zmq_msg_init(&msg);
-	if(0 == err) {
+	err2 = zmq_msg_init(&msg);
+	if(0 == err2) {
 		/* receive message */
-		err = zmq_recv(this, &msg, flags);
-		if(0 == err) {
-			data = zmq_msg_data(&msg);
-			data_len = zmq_msg_size(&msg);
+		err2 = zmq_recv(this1, &msg, flags2);
+		if(0 == err2) {
+			data1 = zmq_msg_data(&msg);
+			data_len1 = zmq_msg_size(&msg);
 		}
 	}
 
-  if(!(-1 == err)) {
-    if(data == NULL) lua_pushnil(L);  else lua_pushlstring(L, data,data_len);
+  if(!(-1 == err2)) {
+    if(data1 == NULL) lua_pushnil(L);  else lua_pushlstring(L, data1,data_len1);
   } else {
     lua_pushnil(L);
   }
-  error_code__ZMQ_Error__push(L, err);
+  error_code__ZMQ_Error__push(L, err2);
 	/* close message */
 	zmq_msg_close(&msg);
 
@@ -2550,41 +2719,41 @@ static int ZMQ_Socket__recv__meth(lua_State *L) {
 
 /* method: new */
 static int ZMQ_Poller__new__meth(lua_State *L) {
-  unsigned int length = luaL_optinteger(L,1,10);
-  int this_flags = OBJ_UDATA_FLAG_OWN;
-  ZMQ_Poller * this;
+  unsigned int length1 = luaL_optinteger(L,1,10);
+  int this_flags1 = OBJ_UDATA_FLAG_OWN;
+  ZMQ_Poller * this1;
 	ZMQ_Poller poller;
-	this = &poller;
-	this->items = (zmq_pollitem_t *)calloc(length, sizeof(zmq_pollitem_t));
-	this->next = -1;
-	this->count = 0;
-	this->len = length;
-	this->free_list = -1;
+	this1 = &poller;
+	this1->items = (zmq_pollitem_t *)calloc(length1, sizeof(zmq_pollitem_t));
+	this1->next = -1;
+	this1->count = 0;
+	this1->len = length1;
+	this1->free_list = -1;
 
-  obj_type_ZMQ_Poller_push(L, this, this_flags);
+  obj_type_ZMQ_Poller_push(L, this1, this_flags1);
   return 1;
 }
 
 /* method: close */
 static int ZMQ_Poller__close__meth(lua_State *L) {
-  int this_flags = 0;
-  ZMQ_Poller * this = obj_type_ZMQ_Poller_delete(L,1,&(this_flags));
-  if(!(this_flags & OBJ_UDATA_FLAG_OWN)) { return 0; }
-	free(this->items);
-	this->items = NULL;
-	this->next = -1;
-	this->count = 0;
-	this->len = 0;
-	this->free_list = -1;
+  int this_flags1 = 0;
+  ZMQ_Poller * this1 = obj_type_ZMQ_Poller_delete(L,1,&(this_flags1));
+  if(!(this_flags1 & OBJ_UDATA_FLAG_OWN)) { return 0; }
+	free(this1->items);
+	this1->items = NULL;
+	this1->next = -1;
+	this1->count = 0;
+	this1->len = 0;
+	this1->free_list = -1;
 
   return 0;
 }
 
 /* method: add */
 static int ZMQ_Poller__add__meth(lua_State *L) {
-  ZMQ_Poller * this = obj_type_ZMQ_Poller_check(L,1);
-  short events = luaL_checkinteger(L,3);
-  int idx = 0;
+  ZMQ_Poller * this1 = obj_type_ZMQ_Poller_check(L,1);
+  short events3 = luaL_checkinteger(L,3);
+  int idx1 = 0;
 	zmq_pollitem_t *item;
 	ZMQ_Socket *sock = NULL;
 	socket_t fd = 0;
@@ -2596,21 +2765,21 @@ static int ZMQ_Poller__add__meth(lua_State *L) {
 	} else {
 		return luaL_typerror(L, 2, "number or ZMQ_Socket");
 	}
-	idx = poller_get_free_item(this);
-	item = &(this->items[idx]);
+	idx1 = poller_get_free_item(this1);
+	item = &(this1->items[idx1]);
 	item->socket = sock;
 	item->fd = fd;
-	item->events = events;
+	item->events = events3;
 
-  lua_pushinteger(L, idx);
+  lua_pushinteger(L, idx1);
   return 1;
 }
 
 /* method: modify */
 static int ZMQ_Poller__modify__meth(lua_State *L) {
-  ZMQ_Poller * this = obj_type_ZMQ_Poller_check(L,1);
-  short events = luaL_checkinteger(L,3);
-  int idx = 0;
+  ZMQ_Poller * this1 = obj_type_ZMQ_Poller_check(L,1);
+  short events3 = luaL_checkinteger(L,3);
+  int idx1 = 0;
 	zmq_pollitem_t *item;
 	ZMQ_Socket *sock = NULL;
 	socket_t fd = 0;
@@ -2618,35 +2787,35 @@ static int ZMQ_Poller__modify__meth(lua_State *L) {
 	if(lua_isuserdata(L, 2)) {
 		sock = obj_type_ZMQ_Socket_check(L, 2);
 		/* find sock in items list. */
-		idx = poller_find_sock_item(this, sock);
+		idx1 = poller_find_sock_item(this1, sock);
 	} else if(lua_isnumber(L, 2)) {
 		fd = lua_tonumber(L, 2);
 		/* find fd in items list. */
-		idx = poller_find_fd_item(this, fd);
+		idx1 = poller_find_fd_item(this1, fd);
 	} else {
 		return luaL_typerror(L, 2, "number or ZMQ_Socket");
 	}
-	if(events != 0) {
+	if(events3 != 0) {
 		/* add/modify. */
-		if(idx < 0) {
-			idx = poller_get_free_item(this);
+		if(idx1 < 0) {
+			idx1 = poller_get_free_item(this1);
 		}
-		item = &(this->items[idx]);
+		item = &(this1->items[idx1]);
 		item->socket = sock;
 		item->fd = fd;
-		item->events = events;
-	} else if(idx >= 0) {
+		item->events = events3;
+	} else if(idx1 >= 0) {
 		/* no events remove socket/fd. */
-		poller_remove_item(this, idx);
+		poller_remove_item(this1, idx1);
 	}
 
-  lua_pushinteger(L, idx);
+  lua_pushinteger(L, idx1);
   return 1;
 }
 
 /* method: remove */
 static int ZMQ_Poller__remove__meth(lua_State *L) {
-  ZMQ_Poller * this = obj_type_ZMQ_Poller_check(L,1);
+  ZMQ_Poller * this1 = obj_type_ZMQ_Poller_check(L,1);
 	ZMQ_Socket *sock;
 	socket_t fd;
 	int idx;
@@ -2655,17 +2824,17 @@ static int ZMQ_Poller__remove__meth(lua_State *L) {
 	if(lua_isuserdata(L, 2)) {
 		sock = obj_type_ZMQ_Socket_check(L, 2);
 		/* find sock in items list. */
-		idx = poller_find_sock_item(this, sock);
+		idx = poller_find_sock_item(this1, sock);
 	} else if(lua_isnumber(L, 2)) {
 		fd = lua_tonumber(L, 2);
 		/* find fd in items list. */
-		idx = poller_find_fd_item(this, fd);
+		idx = poller_find_fd_item(this1, fd);
 	} else {
 		return luaL_typerror(L, 2, "number or ZMQ_Socket");
 	}
 	/* if sock/fd was found. */
 	if(idx >= 0) {
-		poller_remove_item(this, idx);
+		poller_remove_item(this1, idx);
 	}
 
   return 0;
@@ -2673,21 +2842,21 @@ static int ZMQ_Poller__remove__meth(lua_State *L) {
 
 /* method: poll */
 static int ZMQ_Poller__poll__meth(lua_State *L) {
-  ZMQ_Poller * this = obj_type_ZMQ_Poller_check(L,1);
-  long timeout = luaL_checkinteger(L,2);
-  ZMQ_Error err = 0;
+  ZMQ_Poller * this1 = obj_type_ZMQ_Poller_check(L,1);
+  long timeout2 = luaL_checkinteger(L,2);
+  ZMQ_Error err1 = 0;
 	/* poll for events */
-	err = poller_poll(this, timeout);
-	if(err > 0) {
-		this->next = 0;
+	err1 = poller_poll(this1, timeout2);
+	if(err1 > 0) {
+		this1->next = 0;
 	} else {
-		this->next = -1;
+		this1->next = -1;
 	}
 
   /* check for error. */
-  if((-1 == err)) {
-    lua_pushboolean(L, 0);
-      error_code__ZMQ_Error__push(L, err);
+  if((-1 == err1)) {
+    lua_pushnil(L);
+      error_code__ZMQ_Error__push(L, err1);
   } else {
     lua_pushboolean(L, 1);
     lua_pushnil(L);
@@ -2697,17 +2866,17 @@ static int ZMQ_Poller__poll__meth(lua_State *L) {
 
 /* method: next_revents */
 static int ZMQ_Poller__next_revents__meth(lua_State *L) {
-  ZMQ_Poller * this = obj_type_ZMQ_Poller_check(L,1);
-  short revents = 0;
+  ZMQ_Poller * this1 = obj_type_ZMQ_Poller_check(L,1);
+  short revents2 = 0;
 	zmq_pollitem_t *items;
 	int count;
 	int idx;
 
-	revents = -1;
-	idx = this->next;
+	revents2 = -1;
+	idx = this1->next;
 	if(idx >= 0) {
-		count = this->count;
-		items = this->items;
+		count = this1->count;
+		items = this1->items;
 		/* find next item with pending events. */
 		while(idx < count && items[idx].revents == 0) ++idx;
 		/* did we find a pending event? */
@@ -2718,43 +2887,43 @@ static int ZMQ_Poller__next_revents__meth(lua_State *L) {
 			} else {
 				lua_pushnumber(L, items[idx].fd);
 			}
-			revents = items[idx].revents;
+			revents2 = items[idx].revents;
 			/* is this the last event. */
 			++idx;
-			this->next = (idx < count) ? idx : -1;
+			this1->next = (idx < count) ? idx : -1;
 		}
 	}
-	if(revents < 0) {
+	if(revents2 < 0) {
 		/* no more pending events. */
 		lua_pushnil(L);
-		this->next = -1;
+		this1->next = -1;
 	}
 
-  lua_pushinteger(L, revents);
+  lua_pushinteger(L, revents2);
   return 2;
 }
 
 /* method: count */
 static int ZMQ_Poller__count__meth(lua_State *L) {
-  ZMQ_Poller * this = obj_type_ZMQ_Poller_check(L,1);
-  int count = 0;
-	count = this->count;
+  ZMQ_Poller * this1 = obj_type_ZMQ_Poller_check(L,1);
+  int count1 = 0;
+	count1 = this1->count;
 
-  lua_pushinteger(L, count);
+  lua_pushinteger(L, count1);
   return 1;
 }
 
 /* method: term */
 static int ZMQ_Ctx__term__meth(lua_State *L) {
-  int this_flags = 0;
-  ZMQ_Ctx * this = obj_type_ZMQ_Ctx_delete(L,1,&(this_flags));
-  ZMQ_Error rc_zmq_term = 0;
-  if(!(this_flags & OBJ_UDATA_FLAG_OWN)) { return 0; }
-  rc_zmq_term = zmq_term(this);
+  int this_flags1 = 0;
+  ZMQ_Ctx * this1 = obj_type_ZMQ_Ctx_delete(L,1,&(this_flags1));
+  ZMQ_Error rc_zmq_term1 = 0;
+  if(!(this_flags1 & OBJ_UDATA_FLAG_OWN)) { return 0; }
+  rc_zmq_term1 = zmq_term(this1);
   /* check for error. */
-  if((-1 == rc_zmq_term)) {
-    lua_pushboolean(L, 0);
-      error_code__ZMQ_Error__push(L, rc_zmq_term);
+  if((-1 == rc_zmq_term1)) {
+    lua_pushnil(L);
+      error_code__ZMQ_Error__push(L, rc_zmq_term1);
   } else {
     lua_pushboolean(L, 1);
     lua_pushnil(L);
@@ -2764,27 +2933,47 @@ static int ZMQ_Ctx__term__meth(lua_State *L) {
 
 /* method: lightuserdata */
 static int ZMQ_Ctx__lightuserdata__meth(lua_State *L) {
-  ZMQ_Ctx * this = obj_type_ZMQ_Ctx_check(L,1);
-  void * ptr = NULL;
-	ptr = this;
+  ZMQ_Ctx * this1 = obj_type_ZMQ_Ctx_check(L,1);
+  void * ptr1 = NULL;
+	ptr1 = this1;
 
-  lua_pushlightuserdata(L, ptr);
+  lua_pushlightuserdata(L, ptr1);
   return 1;
 }
 
 /* method: socket */
 static int ZMQ_Ctx__socket__meth(lua_State *L) {
-  ZMQ_Ctx * this = obj_type_ZMQ_Ctx_check(L,1);
-  int type = luaL_checkinteger(L,2);
-  int rc_zmq_socket_flags = OBJ_UDATA_FLAG_OWN;
-  ZMQ_Socket rc_zmq_socket;
-  rc_zmq_socket = zmq_socket(this, type);
-  if((NULL == rc_zmq_socket)) {
+  ZMQ_Ctx * this1 = obj_type_ZMQ_Ctx_check(L,1);
+  int type2 = luaL_checkinteger(L,2);
+  int rc_zmq_socket_flags1 = OBJ_UDATA_FLAG_OWN;
+  ZMQ_Socket * rc_zmq_socket1;
+  rc_zmq_socket1 = zmq_socket(this1, type2);
+  if((NULL == rc_zmq_socket1)) {
     lua_pushnil(L);
     lua_pushstring(L, get_zmq_strerror());
   } else {
-    obj_type_ZMQ_Socket_push(L, rc_zmq_socket, rc_zmq_socket_flags);
+    obj_type_ZMQ_Socket_push(L, rc_zmq_socket1, rc_zmq_socket_flags1);
   }
+  return 1;
+}
+
+/* method: start */
+static int ZMQ_StopWatch__start__meth(lua_State *L) {
+  int this_flags1 = OBJ_UDATA_FLAG_OWN;
+  ZMQ_StopWatch * this1;
+  this1 = zmq_stopwatch_start();
+  obj_type_ZMQ_StopWatch_push(L, this1, this_flags1);
+  return 1;
+}
+
+/* method: stop */
+static int ZMQ_StopWatch__stop__meth(lua_State *L) {
+  int this_flags1 = 0;
+  ZMQ_StopWatch * this1 = obj_type_ZMQ_StopWatch_delete(L,1,&(this_flags1));
+  unsigned long usecs1 = 0;
+  if(!(this_flags1 & OBJ_UDATA_FLAG_OWN)) { return 0; }
+  usecs1 = zmq_stopwatch_stop(this1);
+  lua_pushinteger(L, usecs1);
   return 1;
 }
 
@@ -2807,48 +2996,48 @@ static int zmq__version__func(lua_State *L) {
 
 /* method: init */
 static int zmq__init__func(lua_State *L) {
-  int io_threads = luaL_checkinteger(L,1);
-  int rc_zmq_init_flags = OBJ_UDATA_FLAG_OWN;
-  ZMQ_Ctx rc_zmq_init;
-  rc_zmq_init = zmq_init(io_threads);
-  if((NULL == rc_zmq_init)) {
+  int io_threads1 = luaL_checkinteger(L,1);
+  int rc_zmq_init_flags1 = OBJ_UDATA_FLAG_OWN;
+  ZMQ_Ctx * rc_zmq_init1;
+  rc_zmq_init1 = zmq_init(io_threads1);
+  if((NULL == rc_zmq_init1)) {
     lua_pushnil(L);
     lua_pushstring(L, get_zmq_strerror());
   } else {
-    obj_type_ZMQ_Ctx_push(L, rc_zmq_init, rc_zmq_init_flags);
+    obj_type_ZMQ_Ctx_push(L, rc_zmq_init1, rc_zmq_init_flags1);
   }
   return 1;
 }
 
 /* method: init_ctx */
 static int zmq__init_ctx__func(lua_State *L) {
-  ZMQ_Ctx ctx;
+  ZMQ_Ctx * ctx1;
 	if(lua_isuserdata(L, 1)) {
-		ctx = lua_touserdata(L, 1);
+		ctx1 = lua_touserdata(L, 1);
 	} else {
 		return luaL_argerror(L, 1, "expected lightuserdata");
 	}
 
-  if((NULL == ctx)) {
+  if((NULL == ctx1)) {
     lua_pushnil(L);
     lua_pushstring(L, get_zmq_strerror());
   } else {
-    obj_type_ZMQ_Ctx_push(L, ctx, 0);
+    obj_type_ZMQ_Ctx_push(L, ctx1, 0);
   }
   return 1;
 }
 
 /* method: device */
 static int zmq__device__func(lua_State *L) {
-  int device = luaL_checkinteger(L,1);
-  ZMQ_Socket insock = obj_type_ZMQ_Socket_check(L,2);
-  ZMQ_Socket outsock = obj_type_ZMQ_Socket_check(L,3);
-  ZMQ_Error rc_zmq_device = 0;
-  rc_zmq_device = zmq_device(device, insock, outsock);
+  int device1 = luaL_checkinteger(L,1);
+  ZMQ_Socket * insock2 = obj_type_ZMQ_Socket_check(L,2);
+  ZMQ_Socket * outsock3 = obj_type_ZMQ_Socket_check(L,3);
+  ZMQ_Error rc_zmq_device1 = 0;
+  rc_zmq_device1 = zmq_device(device1, insock2, outsock3);
   /* check for error. */
-  if((-1 == rc_zmq_device)) {
-    lua_pushboolean(L, 0);
-      error_code__ZMQ_Error__push(L, rc_zmq_device);
+  if((-1 == rc_zmq_device1)) {
+    lua_pushnil(L);
+      error_code__ZMQ_Error__push(L, rc_zmq_device1);
   } else {
     lua_pushboolean(L, 1);
     lua_pushnil(L);
@@ -2856,14 +3045,30 @@ static int zmq__device__func(lua_State *L) {
   return 2;
 }
 
+/* method: stopwatch_start */
+static int zmq__stopwatch_start__func(lua_State *L) {
+  int rc_zmq_stopwatch_start_flags1 = OBJ_UDATA_FLAG_OWN;
+  ZMQ_StopWatch * rc_zmq_stopwatch_start1;
+  rc_zmq_stopwatch_start1 = zmq_stopwatch_start();
+  obj_type_ZMQ_StopWatch_push(L, rc_zmq_stopwatch_start1, rc_zmq_stopwatch_start_flags1);
+  return 1;
+}
+
+/* method: sleep */
+static int zmq__sleep__func(lua_State *L) {
+  int seconds_1 = luaL_checkinteger(L,1);
+  zmq_sleep(seconds_1);
+  return 0;
+}
+
 /* method: dump_ffi */
 static int zmq__dump_ffi__func(lua_State *L) {
-  size_t ffi_code_len = 0;
-  const char * ffi_code = NULL;
-	ffi_code = zmq_ffi_lua_code;
-	ffi_code_len = sizeof(zmq_ffi_lua_code) - 1;
+  size_t ffi_code_len1 = 0;
+  const char * ffi_code1 = NULL;
+	ffi_code1 = zmq_ffi_lua_code;
+	ffi_code_len1 = sizeof(zmq_ffi_lua_code) - 1;
 
-  if(ffi_code == NULL) lua_pushnil(L);  else lua_pushlstring(L, ffi_code,ffi_code_len);
+  if(ffi_code1 == NULL) lua_pushnil(L);  else lua_pushlstring(L, ffi_code1,ffi_code_len1);
   return 1;
 }
 
@@ -3008,11 +3213,42 @@ static const obj_const obj_ZMQ_Ctx_constants[] = {
   {NULL, NULL, 0.0 , 0}
 };
 
+static const luaL_reg obj_ZMQ_StopWatch_pub_funcs[] = {
+  {"start", ZMQ_StopWatch__start__meth},
+  {NULL, NULL}
+};
+
+static const luaL_reg obj_ZMQ_StopWatch_methods[] = {
+  {"stop", ZMQ_StopWatch__stop__meth},
+  {NULL, NULL}
+};
+
+static const luaL_reg obj_ZMQ_StopWatch_metas[] = {
+  {"__gc", ZMQ_StopWatch__stop__meth},
+  {"__tostring", obj_udata_default_tostring},
+  {"__eq", obj_udata_default_equal},
+  {NULL, NULL}
+};
+
+static const obj_base obj_ZMQ_StopWatch_bases[] = {
+  {-1, NULL}
+};
+
+static const obj_field obj_ZMQ_StopWatch_fields[] = {
+  {NULL, 0, 0, 0}
+};
+
+static const obj_const obj_ZMQ_StopWatch_constants[] = {
+  {NULL, NULL, 0.0 , 0}
+};
+
 static const luaL_reg zmq_function[] = {
   {"version", zmq__version__func},
   {"init", zmq__init__func},
   {"init_ctx", zmq__init_ctx__func},
   {"device", zmq__device__func},
+  {"stopwatch_start", zmq__stopwatch_start__func},
+  {"sleep", zmq__sleep__func},
   {"dump_ffi", zmq__dump_ffi__func},
   {NULL, NULL}
 };
@@ -3079,6 +3315,7 @@ static const reg_sub_module reg_sub_modules[] = {
   { &(obj_type_ZMQ_Socket), 0, obj_ZMQ_Socket_pub_funcs, obj_ZMQ_Socket_methods, obj_ZMQ_Socket_metas, obj_ZMQ_Socket_bases, obj_ZMQ_Socket_fields, obj_ZMQ_Socket_constants},
   { &(obj_type_ZMQ_Poller), 0, obj_ZMQ_Poller_pub_funcs, obj_ZMQ_Poller_methods, obj_ZMQ_Poller_metas, obj_ZMQ_Poller_bases, obj_ZMQ_Poller_fields, obj_ZMQ_Poller_constants},
   { &(obj_type_ZMQ_Ctx), 0, obj_ZMQ_Ctx_pub_funcs, obj_ZMQ_Ctx_methods, obj_ZMQ_Ctx_metas, obj_ZMQ_Ctx_bases, obj_ZMQ_Ctx_fields, obj_ZMQ_Ctx_constants},
+  { &(obj_type_ZMQ_StopWatch), 0, obj_ZMQ_StopWatch_pub_funcs, obj_ZMQ_StopWatch_methods, obj_ZMQ_StopWatch_metas, obj_ZMQ_StopWatch_bases, obj_ZMQ_StopWatch_fields, obj_ZMQ_StopWatch_constants},
   {NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL}
 };
 
@@ -3113,7 +3350,7 @@ static void create_object_instance_cache(lua_State *L) {
 	lua_rawset(L, LUA_REGISTRYINDEX);  /* create reference to weak table. */
 }
 
-LUALIB_API int luaopen_zmq(lua_State *L) {
+LUA_NOBJ_API int luaopen_zmq(lua_State *L) {
 	const reg_sub_module *reg = reg_sub_modules;
 	const luaL_Reg *submodules = submodule_libs;
 	int priv_table = -1;

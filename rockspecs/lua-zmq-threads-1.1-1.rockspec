@@ -1,22 +1,23 @@
 package = "lua-zmq-threads"
-version = "scm-0"
+version = "1.1-1"
 source = {
 	url = "git://github.com/Neopallium/lua-zmq.git",
+	branch = "v1.1",
 }
 description = {
 	summary = "Lua bindings to zeromq2, with LuaJIT2 FFI support.",
 	homepage = "http://github.com/Neopallium/lua-zmq",
-	license = "MIT/X11",
+	license = "MIT/X11"
 }
 dependencies = {
-	"lua-zmq = scm-1",
-	"lua-llthreads = scm-0",
+	"lua-zmq >= 1.1-1",
+	"lua-llthreads >= 1.1-1",
 }
 build = {
 	type = "none",
 	install = {
 		lua = {
 			['zmq.threads'] = "src/threads.lua",
-		},
-	},
+		}
+	}
 }

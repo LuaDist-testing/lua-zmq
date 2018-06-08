@@ -30,41 +30,36 @@ local connect_to = arg[4] or 'inproc://thread_lat_test'
 local zmq = require"zmq"
 local zthreads = require"zmq.threads"
 
-local socket = require"socket"
-local time = socket.gettime
-
 local child_code = [[
 	local connect_to, message_size, message_count = ...
 
 	local zmq = require"zmq"
 	local zthreads = require"zmq.threads"
-	local socket = require"socket"
-	local time = socket.gettime
 
 	local ctx = zthreads.get_parent_ctx()
 	local s = ctx:socket(zmq.PUB)
 	s:connect(connect_to)
 
 	local data = ("0"):rep(message_size)
-	local msg = zmq.zmq_msg_t.init_size(message_size)
+	local msg_data = zmq.zmq_msg_t.init_data(data)
+	local msg = zmq.zmq_msg_t.init()
 
-	local start_time = time()
+	local timer = zmq.stopwatch_start()
 
 	for i = 1, message_count do
-		msg:set_data(data)
+		msg:copy(msg_data)
 		assert(s:send_msg(msg))
 	end
 
-	local end_time = time()
+	local elapsed = timer:stop()
 
 	s:close()
 
-	local elapsed = end_time - start_time
 	if elapsed == 0 then elapsed = 1 end
-	
-	local throughput = message_count / elapsed
+
+	local throughput = message_count / (elapsed / 1000000)
 	local megabits = throughput * message_size * 8 / 1000000
-	
+
 	print(string.format("Sender mean throughput: %i [msg/s]", throughput))
 	print(string.format("Sender mean throughput: %.3f [Mb/s]", megabits))
 
@@ -86,23 +81,22 @@ local msg
 msg = zmq.zmq_msg_t()
 assert(s:recv_msg(msg))
 
-local start_time = time()
+local timer = zmq.stopwatch_start()
 
 for i = 1, message_count - 1 do
 	assert(s:recv_msg(msg))
 	assert(msg:size() == message_size, "Invalid message size")
 end
 
-local end_time = time()
+local elapsed = timer:stop()
 
 s:close()
 child_thread:join()
 ctx:term()
 
-local elapsed = end_time - start_time
 if elapsed == 0 then elapsed = 1 end
 
-local throughput = message_count / elapsed
+local throughput = message_count / (elapsed / 1000000)
 local megabits = throughput * message_size * 8 / 1000000
 
 print(string.format("mean throughput: %i [msg/s]", throughput))

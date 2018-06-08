@@ -19,7 +19,7 @@
 -- THE SOFTWARE.
 
 -- make generated variable nicer.
-set_variable_format "%s"
+set_variable_format "%s%d"
 
 c_module "zmq" {
 -- module settings.
@@ -46,9 +46,11 @@ static const char *get_zmq_strerror() {
 	case EAGAIN:
 		return "timeout";
 		break;
+#if defined(ETERM)
 	case ETERM:
 		return "closed";
 		break;
+#endif
 	default:
 		break;
 	}
@@ -134,6 +136,7 @@ subfiles {
 "src/socket.nobj.lua",
 "src/poller.nobj.lua",
 "src/ctx.nobj.lua",
+"src/stopwatch.nobj.lua",
 },
 
 --
@@ -156,11 +159,11 @@ c_function "version" {
 ]],
 },
 c_function "init" {
-	c_call "!ZMQ_Ctx" "zmq_init" { "int", "io_threads" },
+	c_call "!ZMQ_Ctx *" "zmq_init" { "int", "io_threads" },
 },
 c_function "init_ctx" {
 	var_in{ "<any>", "ptr" },
-	var_out{ "ZMQ_Ctx", "ctx" },
+	var_out{ "ZMQ_Ctx *", "ctx" },
 	c_source[[
 	if(lua_isuserdata(L, ${ptr::idx})) {
 		${ctx} = lua_touserdata(L, ${ptr::idx});
@@ -181,9 +184,19 @@ c_function "init_ctx" {
 },
 c_function "device" {
 	c_call "ZMQ_Error" "zmq_device"
-		{ "int", "device", "ZMQ_Socket", "insock", "ZMQ_Socket", "outsock" },
+		{ "int", "device", "ZMQ_Socket *", "insock", "ZMQ_Socket *", "outsock" },
 },
 
+--
+-- zmq_utils.h
+--
+include "zmq_utils.h",
+c_function "stopwatch_start" {
+	c_call "!ZMQ_StopWatch *" "zmq_stopwatch_start" {},
+},
+c_function "sleep" {
+	c_call "void" "zmq_sleep" { "int", "seconds_" },
+},
 --
 -- This dump function is for getting a copy of the FFI-based bindings code and is
 -- only for debugging.
